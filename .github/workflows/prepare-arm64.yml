@@ -17,13 +17,13 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 35
     env:
-      SOURCE_SHA: 0090bbde1bdfeea727e5f01a5a027a458005809a
-      APP_IMAGE: dokihot:0090bbde1bdfeea727e5f01a5a027a458005809a-arm64
+      SOURCE_SHA: ba89466e27e4714f67ccebc89c4cbd020aed4881
+      APP_IMAGE: dokihot:ba89466e27e4714f67ccebc89c4cbd020aed4881-arm64
       COMPOSE_PROJECT_NAME: dokihot-artifact-check
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 0090bbde1bdfeea727e5f01a5a027a458005809a
+          ref: ba89466e27e4714f67ccebc89c4cbd020aed4881
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -35,10 +35,17 @@ jobs:
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test "$(uname -m)" = aarch64
           test -z "$(git status --porcelain)"
-          for image in node:24-trixie-slim postgres:17-alpine caddy:2-alpine; do
-            docker pull --platform linux/arm64 "$image"
-            test "$(docker image inspect "$image" --format '{{.Architecture}}')" = arm64
-          done
+          # Preserve the previously accepted dependency images; only the application is updated.
+          while read -r tag digest expected_id; do
+            docker pull --platform linux/arm64 "$digest"
+            docker tag "$digest" "$tag"
+            test "$(docker image inspect "$tag" --format '{{.Architecture}}')" = arm64
+            test "$(docker image inspect "$tag" --format '{{.Id}}')" = "$expected_id"
+          done <<'IMAGES'
+          node:24-trixie-slim node@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea sha256:9eda3a1599206db0753a87c46cc52f3fa4ffc3e1aa34b85460172d4052215771
+          postgres:17-alpine postgres@sha256:1bcc18d81671b02906296aad470ec9778a6b71016ce953092024b680bad007b0 sha256:9355df27b2506973cfc421408623435f15298511c2cdadc502b7aa580efe611f
+          caddy:2-alpine caddy@sha256:24ec7b05bc532c7bb57f727030c5056e257ff7138b4b50460306819ff79362bd sha256:c7d68e4fa1bb71ae97c0b7e2c468aa3ccad2ae75d0294697d401e28794a5b5ab
+          IMAGES
       - name: Build fixed application without any environment file
         run: |
           set -euo pipefail
@@ -80,10 +87,10 @@ jobs:
           set -euo pipefail
           bundle="$RUNNER_TEMP/dokihot-arm64-bundle"
           mkdir -p "$bundle"
-          docker image save "$APP_IMAGE" postgres:17-alpine caddy:2-alpine | gzip -1 > "$bundle/dokihot-0090bbd-arm64-images.tar.gz"
-          gzip -t "$bundle/dokihot-0090bbd-arm64-images.tar.gz"
-          docker image load -i "$bundle/dokihot-0090bbd-arm64-images.tar.gz"
-          git archive --format=tar.gz HEAD > "$bundle/source-0090bbd.tar.gz"
+          docker image save "$APP_IMAGE" | gzip -1 > "$bundle/dokihot-ba89466-arm64-images.tar.gz"
+          gzip -t "$bundle/dokihot-ba89466-arm64-images.tar.gz"
+          docker image load -i "$bundle/dokihot-ba89466-arm64-images.tar.gz"
+          git archive --format=tar.gz HEAD > "$bundle/source-ba89466.tar.gz"
           BUNDLE_DIR="$bundle" python3 - <<'PY'
           import datetime, json, os, pathlib, subprocess
           def output(args): return subprocess.check_output(args, text=True).strip()
@@ -103,20 +110,21 @@ jobs:
               'platform': 'linux/arm64',
               'application_image': os.environ['APP_IMAGE'],
               'images': images,
-              'archive_images': [os.environ['APP_IMAGE'], 'postgres:17-alpine', 'caddy:2-alpine'],
+              'archive_images': [os.environ['APP_IMAGE']],
+              'unchanged_dependency_images': ['postgres:17-alpine', 'caddy:2-alpine'],
               'base_image_record_only': 'node:24-trixie-slim',
               'checks': ['native-arm64', 'no-private-build-files', 'compose-health', 'migrations-and-source-seed', 'password-login-logout-session-revocation', 'site-smoke', 'mcp-contract', 'running-image-id-match', 'caddy-config-validation', 'archive-load'],
               'deployment_performed': False,
-              'notes': ['Docker image Id is a config digest, not a registry manifest digest.', 'No production environment, data volume, credentials or certificates are included.', 'Node base is recorded for provenance but is not needed in the delivery archive.', 'Caddy configuration is validated offline; public HTTPS/DNS/Oracle coexistence are not accepted by these checks.'],
+              'notes': ['Docker image Id is a config digest, not a registry manifest digest.', 'Only the application image is delivered; PostgreSQL and Caddy are unchanged and record-only. No production environment, data volume, credentials or certificates are included.', 'Node base is recorded for provenance but is not needed in the delivery archive.', 'Caddy configuration is validated offline; public HTTPS/DNS/Oracle coexistence are not accepted by these checks.'],
           }
           assert manifest['source_sha'] == os.environ['SOURCE_SHA']
           pathlib.Path(os.environ['BUNDLE_DIR'], 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
           PY
-          (cd "$bundle" && sha256sum dokihot-0090bbd-arm64-images.tar.gz source-0090bbd.tar.gz manifest.json > SHA256SUMS && sha256sum --check SHA256SUMS)
+          (cd "$bundle" && sha256sum dokihot-ba89466-arm64-images.tar.gz source-ba89466.tar.gz manifest.json > SHA256SUMS && sha256sum --check SHA256SUMS)
       - name: Upload offline delivery bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: dokihot-0090bbd-linux-arm64
+          name: dokihot-ba89466-linux-arm64
           path: ${{ runner.temp }}/dokihot-arm64-bundle/
           compression-level: 0
           retention-days: 30
