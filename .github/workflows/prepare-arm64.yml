@@ -1,0 +1,127 @@
+# Build an offline delivery bundle only. Never connects to a deployment host or publishes a registry tag.
+name: Prepare DokiHot ARM64 bundle
+
+on:
+  push:
+    branches: [codex/prepare-dokihot-arm64]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prepare-dokihot-arm64
+  cancel-in-progress: false
+
+jobs:
+  bundle:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: 0090bbde1bdfeea727e5f01a5a027a458005809a
+      APP_IMAGE: dokihot:0090bbde1bdfeea727e5f01a5a027a458005809a-arm64
+      COMPOSE_PROJECT_NAME: dokihot-artifact-check
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 0090bbde1bdfeea727e5f01a5a027a458005809a
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Verify source and pull ARM64 dependencies
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(uname -m)" = aarch64
+          test -z "$(git status --porcelain)"
+          for image in node:24-trixie-slim postgres:17-alpine caddy:2-alpine; do
+            docker pull --platform linux/arm64 "$image"
+            test "$(docker image inspect "$image" --format '{{.Architecture}}')" = arm64
+          done
+      - name: Build fixed application without any environment file
+        run: |
+          set -euo pipefail
+          test ! -e .env
+          docker build --platform linux/arm64 --pull=false \
+            --label "org.opencontainers.image.revision=$SOURCE_SHA" \
+            --label "org.opencontainers.image.source=https://github.com/Brilliant666/AIHOT" \
+            --tag "$APP_IMAGE" .
+          test "$(docker image inspect "$APP_IMAGE" --format '{{.Architecture}}')" = arm64
+          docker run --rm --network none --entrypoint sh "$APP_IMAGE" -ec \
+            'test ! -e /app/.env && test ! -e /app/.backups && test ! -e /app/.cache && test ! -e /app/.git'
+      - name: Configure isolated acceptance site
+        run: |
+          set -euo pipefail
+          # Generated disposable credentials stay in this runner and are never exported or logged.
+          node scripts/init-env.ts > /dev/null
+          sed -i 's/^COLLECT_ENABLED=.*/COLLECT_ENABLED=false/; s/^MODEL_CALLS_ENABLED=.*/MODEL_CALLS_ENABLED=false/' .env
+          printf '\nSITE_URL=http://127.0.0.1:3000\nMCP_ALLOWED_HOSTS=web\nAIHOT_RELEASE=%s\n' "$SOURCE_SHA" >> .env
+          docker compose config --quiet
+          docker compose up -d --no-build --pull never --wait --wait-timeout 240 db setup api worker web
+      - name: Verify real database, login, logout, site and MCP
+        run: |
+          set -euo pipefail
+          node --env-file=.env scripts/check-admin-session.ts --base http://127.0.0.1:3000
+          docker compose run --rm --no-deps --entrypoint node setup scripts/smoke.ts --base http://web:3000
+          docker compose run --rm --no-deps --entrypoint node setup scripts/mcp-check.ts http://web:3000/api/mcp
+          docker compose exec -T db psql -U aihot -d aihot -Atc "select count(*) from sources" | grep -qx "$(node -p "require('./industry/sources.json').sources.length")"
+          for service in api worker web; do
+            actual=$(docker inspect "$(docker compose ps -q "$service")" --format '{{.Image}}')
+            test "$actual" = "$(docker image inspect "$APP_IMAGE" --format '{{.Id}}')"
+          done
+          # Validate the actual bundled reverse-proxy binary/config without opening a public listener or requesting a certificate.
+          docker run --rm --network none -e SITE_DOMAIN=rardar.dokitool.com \
+            -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: Export verified images and source with provenance
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/dokihot-arm64-bundle"
+          mkdir -p "$bundle"
+          docker image save "$APP_IMAGE" postgres:17-alpine caddy:2-alpine | gzip -1 > "$bundle/dokihot-0090bbd-arm64-images.tar.gz"
+          gzip -t "$bundle/dokihot-0090bbd-arm64-images.tar.gz"
+          docker image load -i "$bundle/dokihot-0090bbd-arm64-images.tar.gz"
+          git archive --format=tar.gz HEAD > "$bundle/source-0090bbd.tar.gz"
+          BUNDLE_DIR="$bundle" python3 - <<'PY'
+          import datetime, json, os, pathlib, subprocess
+          def output(args): return subprocess.check_output(args, text=True).strip()
+          images = {}
+          for name in [os.environ['APP_IMAGE'], 'postgres:17-alpine', 'caddy:2-alpine', 'node:24-trixie-slim']:
+              item = json.loads(output(['docker', 'image', 'inspect', name]))[0]
+              assert item['Architecture'] == 'arm64' and item['Os'] == 'linux'
+              images[name] = {key: item.get(key) for key in ['Id', 'RepoTags', 'RepoDigests', 'Architecture', 'Os', 'Size']}
+          manifest = {
+              'schema': 1,
+              'source_repository': 'https://github.com/Brilliant666/AIHOT',
+              'source_sha': output(['git', 'rev-parse', 'HEAD']),
+              'source_tree': output(['git', 'rev-parse', 'HEAD^{tree}']),
+              'workflow_sha': os.environ['GITHUB_SHA'],
+              'run_url': f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              'created_at_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'platform': 'linux/arm64',
+              'application_image': os.environ['APP_IMAGE'],
+              'images': images,
+              'archive_images': [os.environ['APP_IMAGE'], 'postgres:17-alpine', 'caddy:2-alpine'],
+              'base_image_record_only': 'node:24-trixie-slim',
+              'checks': ['native-arm64', 'no-private-build-files', 'compose-health', 'migrations-and-source-seed', 'password-login-logout-session-revocation', 'site-smoke', 'mcp-contract', 'running-image-id-match', 'caddy-config-validation', 'archive-load'],
+              'deployment_performed': False,
+              'notes': ['Docker image Id is a config digest, not a registry manifest digest.', 'No production environment, data volume, credentials or certificates are included.', 'Node base is recorded for provenance but is not needed in the delivery archive.', 'Caddy configuration is validated offline; public HTTPS/DNS/Oracle coexistence are not accepted by these checks.'],
+          }
+          assert manifest['source_sha'] == os.environ['SOURCE_SHA']
+          pathlib.Path(os.environ['BUNDLE_DIR'], 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+          (cd "$bundle" && sha256sum dokihot-0090bbd-arm64-images.tar.gz source-0090bbd.tar.gz manifest.json > SHA256SUMS && sha256sum --check SHA256SUMS)
+      - name: Upload offline delivery bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dokihot-0090bbd-linux-arm64
+          path: ${{ runner.temp }}/dokihot-arm64-bundle/
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+      - name: Acceptance logs on failure
+        if: failure()
+        run: docker compose logs --tail 60
+      - name: Remove disposable acceptance containers and volumes
+        if: always()
+        run: docker compose down -v
