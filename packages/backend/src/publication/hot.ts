@@ -66,8 +66,9 @@ async function queryExtras(ranking: HotRanking): Promise<Extras> {
     sql<{ name: string; icon_url: string | null; avatar: string | null }[]>`
       SELECT DISTINCT ON (s.id) s.name, s.icon_url, a.x_post->>'avatarUrl' AS avatar
       FROM story_signals ss JOIN sources s ON s.id = ss.source_id
+      JOIN publications p ON p.article_id = ss.article_id AND p.visibility = 'public'
       LEFT JOIN articles a ON a.id = CASE WHEN s.icon_url IS NULL THEN ss.article_id END AND a.x_post ? 'avatarUrl'
-      WHERE ss.story_id = ANY(${ids}::bigint[])
+      WHERE ss.story_id = ANY(${ids}::bigint[]) AND s.participation_mode <> 'isolated'
       ORDER BY s.id, (a.id IS NULL), a.discovered_at DESC, a.id DESC`,
     storyTexts(ids),
   ]);

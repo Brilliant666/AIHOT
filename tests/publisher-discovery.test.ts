@@ -9,6 +9,9 @@ import { stopBoss } from "@aihot/backend/jobs/queue";
 import { upsertMaterial } from "@aihot/backend/content/materials";
 import { publisherOwnsUrl } from "@aihot/backend/content/provenance";
 import { assertSupportedConfig } from "@aihot/backend/sources/config-keys";
+import { config } from "@aihot/backend/config";
+import { publishArticle } from "@aihot/backend/publication/publish";
+import { loadItemShare } from "@aihot/backend/publication/og";
 
 after(async () => { await stopBoss(); await closeDb(); });
 async function source(tier: string, config: Record<string, unknown> = {}) {
@@ -18,6 +21,28 @@ async function source(tier: string, config: Record<string, unknown> = {}) {
   return id;
 }
 const discover = (sourceId: string, url: string) => upsertMaterial({ sourceId, url, title: "An original article", via: "fetch" });
+
+test("collection-only publisher attribution cannot turn a signal into a public page", async () => {
+  const scope = `https://${tag()}.example/blog`;
+  const official = await source("T1", { publisherUrlPrefixes: [scope], publisherRequiresDiscovery: true });
+  const signal = await source("T2");
+  await sql`UPDATE sources SET participation_mode='hot_signal' WHERE id=${signal}`;
+  const first = await discover(signal, `${scope}/original`);
+  assert.equal((await publishArticle(first.articleId))?.visibility, "public");
+  assert.equal(await loadItemShare(first.articleId), null);
+  config.modelCallsEnabled = false;
+  try {
+    await discover(official, `${scope}/original`);
+    const [row] = await sql`SELECT a.source_id,a.processing_state,p.visibility FROM articles a JOIN publications p ON p.article_id=a.id WHERE a.id=${first.articleId}`;
+    assert.deepEqual(row, { source_id: official, processing_state: "new", visibility: "withdrawn" });
+    assert.equal(await loadItemShare(first.articleId), null);
+  } finally { config.modelCallsEnabled = true; }
+  assert.equal((await publishArticle(first.articleId))?.visibility, "withdrawn", "rebuild waits for the first editorial analysis");
+  await sql`INSERT INTO analyses(article_id,input_revision,origin,relevance,title_zh,summary_zh,selected)
+    VALUES(${first.articleId},1,'rule','pass','官方文章','已判定摘要',false)`;
+  assert.equal((await publishArticle(first.articleId))?.visibility, "public");
+  assert.ok(await loadItemShare(first.articleId));
+});
 
 test("shared-host ownership requires both the explicit scope and this source's actual discovery", async () => {
   const scope = `https://${tag()}.example/blog`;

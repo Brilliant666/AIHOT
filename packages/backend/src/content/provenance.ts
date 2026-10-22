@@ -2,6 +2,7 @@
 // when collection is paused. Shared-platform scopes and implicit web-list scopes also need an
 // actual discovery of this article by the publisher's filtered source.
 import { audit } from "../audit.ts";
+import { config } from "../config.ts";
 import { sql, type Db } from "../db.ts";
 import { publishArticleTx } from "../publication/publish.ts";
 import { emit } from "../modules.ts";
@@ -87,7 +88,10 @@ export async function reconcileMaterialSource(db: Db, articleId: string, observe
   await audit("system", "article.attribution", `article:${articleId}`, "唯一 T1 原发信源与已验证 URL 范围一致（显式配置或已观察官网列表）",
     { sourceId: article.source_id, author: article.author }, { sourceId: publisher.id, author }, { db });
   // This changes attribution and the public seat, not the judgement or selection threshold.
-  const published = await publishArticleTx(db as Parameters<typeof publishArticleTx>[0], articleId);
+  const expandsReading = article.participation_mode !== "editorial" && publisher.participation_mode === "editorial";
+  const published = await publishArticleTx(db as Parameters<typeof publishArticleTx>[0], articleId, {
+    holdForProcessing: !config.modelCallsEnabled && expandsReading,
+  });
   if (wasReadable && published?.changed) await emit("articleChanged", { id: articleId, kind: "content", reduced: published.reduced, reason: "publisher attribution" }, db);
   return true;
 }

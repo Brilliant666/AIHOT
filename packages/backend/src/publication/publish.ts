@@ -290,26 +290,29 @@ export async function publishArticleTx(tx: Tx, articleId: string, options: Publi
   // Material from an isolated source reaches no public surface at all: not even a detail page.
   // A held revision must finish processing before a rebuild can expose its new body. This is
   // projection state, not an editorial withdrawal: successful processing can release it later.
-  const pendingRevision = article.revision > 1 && source.participation_mode === "editorial" && analysis?.input_revision !== article.revision;
+  const pendingRevision = source.participation_mode === "editorial" && analysis?.input_revision !== article.revision;
+  const preserveScope = !config.modelCallsEnabled && !!previous;
   const visibility = source.participation_mode === "isolated" || options.holdForProcessing
     || (previous?.visibility === "withdrawn" && (!config.modelCallsEnabled || pendingRevision))
-    ? "withdrawn" : (override?.visibility ?? "public");
+    ? "withdrawn" : (preserveScope && previous.visibility === "summary-only" && override?.visibility !== "withdrawn"
+      ? "summary-only" : (override?.visibility ?? "public"));
 
   // An undated archive has a readable detail page, but its discovery is not a news timestamp.
   // Explicit imports can retain an editorial decision already published elsewhere.
   const eligible = isPoolEligible({ participationMode: source.participation_mode, relevance, title, summary, originalPost: !!original })
-    && (!article.backfill || article.published_at !== null || !!options.releasedAt);
-  const selectionCandidate = isSelectable(eligible, judgedSelected, source.tier);
+    && (!article.backfill || article.published_at !== null || !!options.releasedAt)
+    && (!preserveScope || previous.eligible);
+  const selectionCandidate = isSelectable(eligible, judgedSelected, source.tier) && (!preserveScope || previous.selection_candidate);
   // Scoring nominates a report; a completed identity/value decision admits it to selection.
   // A historical import already has its public decision. Preserve that confirmed state on rebuild.
   const selected = selectionCandidate && article.grouping_status === "complete"
-    && (f.selected === true || article.selection_adds_value !== false);
+    && (f.selected === true || article.selection_adds_value !== false) && (!preserveScope || previous.selected);
   const reason = selected ? pickString(f.reason, original ? null : analysis?.reason_zh ?? null) : null;
   const hasXPost = !!article.x_post;
   const channel = channelOf(source.kind, hasXPost);
   const hasBody = !!article.body_text || !!article.x_post?.text || !!article.x_post?.media?.length || !!article.x_post?.quoted?.text;
-  const bodyMode = bodyModeOf(source, article.body_status, hasBody);
-  const syndicate = mayRedistribute(source, bodyMode);
+  const bodyMode = preserveScope && previous.body_mode !== "full" ? "summary" : bodyModeOf(source, article.body_status, hasBody);
+  const syndicate = mayRedistribute(source, bodyMode) && (!preserveScope || previous.syndicate);
   const originalTitle = isChineseTitle && title === collapseWhitespace(article.title) ? null : collapseWhitespace(article.title);
 
   // Waiting candidates are readable in the pool, with no selected seat, sync entry or push.
@@ -319,7 +322,7 @@ export async function publishArticleTx(tx: Tx, articleId: string, options: Publi
 
   const indexable = isIndexable({
     visibility, sourceMode: source.participation_mode, hasSummary: !!summary, selected, seoIndexedAt: previous?.seo_indexed_at ?? null, seoExcludedAt: previous?.seo_excluded_at ?? null,
-  });
+  }) && (!preserveScope || previous.indexable);
   const searchText = collapseWhitespace(
     [title, originalTitle, summary, publicSourceName(source.name), ...displayTags(tags), ...(analysis?.subjects ?? [])].filter(Boolean).join(" "),
   ).toLowerCase();

@@ -2,6 +2,7 @@
 // X accounts take the avatar on their latest post; 公众号 the account avatar on their latest article
 // page; sites the best icon their home page declares. A source with none keeps its tinted initial.
 import { sql } from "../db.ts";
+import { config } from "../config.ts";
 import { guardedFetch, DEFAULT_UA } from "../lib/http-fetch.ts";
 import { produceImage } from "../media/images.ts";
 import { sourceOwnsPost } from "./account.ts";
@@ -14,11 +15,13 @@ const MP_PAUSE_MS = 3000;
 
 /** X accounts: the avatar on the account's own latest post, kept current as avatars change. */
 async function refreshXAvatars(): Promise<number> {
+  if (!config.modelCallsEnabled) return 0;
   const rows = await sql`
     UPDATE sources s SET icon_url = x.avatar
     FROM (
       SELECT DISTINCT ON (a.source_id) a.source_id, a.x_post->>'avatarUrl' AS avatar
       FROM articles a JOIN sources xs ON xs.id = a.source_id AND xs.kind = 'x_search'
+      JOIN publications p ON p.article_id = a.id AND p.visibility = 'public'
       WHERE a.x_post ? 'avatarUrl'
         AND ${sourceOwnsPost(sql`xs.config`, sql`a.x_post->>'handle'`)}
       ORDER BY a.source_id, a.discovered_at DESC

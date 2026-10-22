@@ -117,7 +117,7 @@ test("models off cannot publish an isolated projection by changing its source to
   config.modelCallsEnabled = false;
   try {
     const [before] = await sql`SELECT updated_at FROM sources WHERE id=${source}`;
-    await updateSource(source, { patch: { participation_mode: "editorial" }, version: before!.updated_at.toISOString() }, "test");
+    await assert.rejects(updateSource(source, { patch: { participation_mode: "editorial" }, version: before!.updated_at.toISOString() }, "test"), /不能扩大公开范围/);
     await republishSource(source);
     assert.equal((await sql`SELECT visibility FROM publications WHERE article_id=${articleId}`)[0]!.visibility, "withdrawn");
     assert.equal((await get(`/api/site/items/${articleId}`)).status, 404);
@@ -125,6 +125,44 @@ test("models off cannot publish an isolated projection by changing its source to
   } finally {
     config.modelCallsEnabled = true;
   }
+});
+
+test("collection-only source edits cannot expand detail or full-text permissions", async () => {
+  const source = `hold-hot-projection-${T}`;
+  await sql`INSERT INTO sources(id,name,kind,tier,participation_mode,site_fulltext,syndicate_fulltext,next_fetch_at)
+    VALUES(${source},'Signal projection','rss','T1','hot_signal',false,false,'2100-01-01')`;
+  const { articleId } = await upsertMaterial({ sourceId: source, url: `https://example.org/hold-hot/${T}`,
+    title: `仅热度材料${T}`, bodyText: BODY, bodyStatus: "ok", via: "fetch" });
+  assert.equal((await publishArticle(articleId))?.visibility, "public");
+  assert.equal((await get(`/api/site/items/${articleId}`)).status, 404);
+  config.modelCallsEnabled = false;
+  try {
+    const [before] = await sql`SELECT updated_at FROM sources WHERE id=${source}`;
+    for (const patch of [{ participation_mode: "editorial" }, { site_fulltext: true }, { syndicate_fulltext: true }]) {
+      await assert.rejects(updateSource(source, { patch, version: before!.updated_at.toISOString() }, "test"), /不能扩大公开范围/);
+      assert.equal((await get(`/api/site/items/${articleId}`)).status, 404, "no immediate live-source join exposure");
+    }
+    await updateSource(source, { patch: { participation_mode: "isolated" }, version: before!.updated_at.toISOString() }, "test");
+    assert.equal((await get(`/api/site/items/${articleId}`)).status, 404, "restrictions remain available");
+  } finally { config.modelCallsEnabled = true; }
+});
+
+test("collection-only republishing cannot expand the existing public projection", async () => {
+  const id = await article();
+  await publishArticle(id, released());
+  await sql`UPDATE publications SET visibility='summary-only',body_mode='summary',syndicate=false,eligible=false,
+    selected=false,selection_candidate=false,indexable=false WHERE article_id=${id}`;
+  config.modelCallsEnabled = false;
+  try {
+    await publishArticle(id);
+    const [projection] = await sql`SELECT visibility,body_mode,syndicate,eligible,selected,selection_candidate,indexable FROM publications WHERE article_id=${id}`;
+    assert.deepEqual(projection, { visibility: "summary-only", body_mode: "summary", syndicate: false,
+      eligible: false, selected: false, selection_candidate: false, indexable: false });
+    const original = await get(`/api/site/items/${id}/original`);
+    assert.equal(original.status, 200);
+    assert.ok(!original.body.includes(BODY));
+    assert.ok(!(await get("/feed/full.xml")).body.includes(id));
+  } finally { config.modelCallsEnabled = true; }
 });
 
 test("models off permits withdrawing public material but not restoring a withdrawn projection", async () => {
