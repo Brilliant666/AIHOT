@@ -114,10 +114,17 @@ async function findIcon(kind: string, articleUrls: string[], config: Record<stri
 
 /** Sites and 公众号 without an icon: a batch per run, looking again after RETRY_DAYS (公众号: MP_RETRY_DAYS). */
 async function findMissingIcons(): Promise<{ checked: number; found: number }> {
+  // Article-derived source icons are public metadata too. Use only published URLs; raw
+  // collection (including a held revision) must not reveal its account avatar via this cache.
   const due = await sql<{ id: string; kind: string; config: Record<string, unknown>; urls: string[] | null }[]>`
     SELECT s.id, s.kind, s.config, a.urls
     FROM sources s
-    LEFT JOIN LATERAL (SELECT array_agg(url) AS urls FROM (SELECT url FROM articles WHERE source_id = s.id ORDER BY discovered_at DESC LIMIT 10) r) a ON true
+    LEFT JOIN LATERAL (
+      SELECT array_agg(url) AS urls FROM (
+        SELECT p.url FROM publications p WHERE p.source_id = s.id AND p.visibility = 'public'
+        ORDER BY p.discovered_at DESC LIMIT 10
+      ) r
+    ) a ON true
     WHERE s.enabled AND s.icon_url IS NULL AND s.kind <> 'x_search'
       AND (s.icon_checked_at IS NULL OR s.icon_checked_at < now() - make_interval(days => CASE WHEN s.kind = 'mp_account' THEN ${MP_RETRY_DAYS}::int ELSE ${RETRY_DAYS}::int END))
     ORDER BY s.icon_checked_at NULLS FIRST, s.id

@@ -123,3 +123,36 @@ test("icon refresh makes no requests for paused sources, including one paused wh
     await Promise.all(sources.map(source => source.server.close()));
   }
 });
+
+test("source icons never derive from unpublished or withdrawn article URLs, even after models resume", async () => {
+  const id = `${T}-private-mp-icon`;
+  const page = await stub(() => ({ round_head_img: "https://example.org/PRIVATE-account-avatar.png" }));
+  await sql`INSERT INTO sources(id,name,kind,config,next_fetch_at)
+    VALUES(${id},${id},'mp_account','{}','2100-01-01')`;
+  for (const suffix of ['unpublished', 'withdrawn']) {
+    const articleId = `${id}-${suffix}`;
+    await sql`INSERT INTO articles(id,source_id,identity_key,url,title,discovered_at,timeline_at)
+      VALUES(${articleId},${id},${articleId},${`${page.url}/${suffix}`},'Private material',now(),now())`;
+  }
+  const withdrawnId = `${id}-withdrawn`;
+  await sql`INSERT INTO publications(article_id,source_id,title,url,timeline_at,discovered_at,sort_at,body_mode,visibility,channel)
+    VALUES(${withdrawnId},${id},'Private material',${`${page.url}/withdrawn`},now(),now(),now(),'summary','withdrawn','news')`;
+  try {
+    for (const enabled of [false, true]) {
+      config.modelCallsEnabled = enabled;
+      await sql`UPDATE sources SET icon_checked_at=NULL WHERE id=${id}`;
+      await refreshSourceIcons();
+      assert.equal(page.hits(), 0, `models ${enabled}: private article pages must not be used for public source icons`);
+      assert.equal((await sql`SELECT icon_url FROM sources WHERE id=${id}`)[0]!.icon_url, null);
+    }
+    await sql`UPDATE publications SET visibility='public' WHERE article_id=${withdrawnId}`;
+    await sql`UPDATE sources SET icon_checked_at=NULL WHERE id=${id}`;
+    await refreshSourceIcons();
+    assert.equal(page.hits(), 1, "a published article remains a usable icon discovery page");
+  } finally {
+    config.modelCallsEnabled = true;
+    await sql`DELETE FROM articles WHERE source_id=${id}`;
+    await sql`DELETE FROM sources WHERE id=${id}`;
+    await page.close();
+  }
+});
