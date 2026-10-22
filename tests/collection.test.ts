@@ -72,16 +72,18 @@ test("daily adaptation preserves manual intervals and changes only explicitly op
   const ids: string[] = [];
   const expected = new Map<string, number>();
   try {
-    for (const kind of ["rss", "web_list", "json_list", "x_search"] as const) {
+    for (const variant of ["rss", "web_list", "json_list", "x_search", "x_shard"] as const) {
+      const kind = variant === "x_shard" ? "x_search" : variant;
       for (const mode of ["default", "false", "true", "paused", "invalid"] as const) {
-        const id = `${T}-interval-${kind}-${mode}`;
+        const id = `${T}-interval-${variant}-${mode}`;
         ids.push(id);
         const settings = mode === "default" ? {} : { _aihot: { adaptiveInterval: mode === "false" ? false : mode === "invalid" ? "true" : true } };
-        const config = kind === "x_search" ? { ...settings, query: `from:manual${T}` } : settings;
-        await sql`INSERT INTO sources(id,name,kind,config,enabled,interval_minutes,cursor,next_fetch_at)
-          VALUES(${id},${id},${kind},${sql.json(config)},${mode !== "paused"},180,
+        // Only a plain account search excluding replies can join a shard; other quiet X searches keep the 120-minute cap.
+        const config = kind === "x_search" ? { ...settings, query: `from:manual${T.slice(-7)}${variant === "x_shard" ? " -filter:replies" : ""}` } : settings;
+        await sql`INSERT INTO sources(id,name,kind,config,enabled,participation_mode,interval_minutes,cursor,next_fetch_at)
+          VALUES(${id},${id},${kind},${sql.json(config)},${mode !== "paused"},'editorial',180,
             ${sql.json({ initializedAt: new Date().toISOString(), lastTweetId: "100" })},'2100-01-01')`;
-        expected.set(id, mode === "true" ? kind === "x_search" ? 30 : 60 : 180);
+        expected.set(id, mode === "true" ? variant === "x_shard" ? 30 : kind === "x_search" ? 120 : 60 : 180);
       }
     }
     await adaptIntervals();

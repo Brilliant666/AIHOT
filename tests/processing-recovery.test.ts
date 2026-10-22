@@ -197,6 +197,7 @@ test("an already released receipt wakes its failed grouping job once, with the o
 });
 
 test("a temporary provider failure resumes the manual evaluation instead of reinstalling the old verdict", async () => {
+  const callsBefore = calls.length;
   const id = await article("retry");
   assert.equal((await processArticle(id)).state, "block");
   original = false;
@@ -211,8 +212,9 @@ test("a temporary provider failure resumes the manual evaluation instead of rein
   await waitFor(async () => (await sql`SELECT 1 FROM pgboss.job WHERE name=${QUEUES.analyze} AND data->>'articleId'=${id} AND state<'completed'`).length === 0);
   assert.equal((await sql`SELECT processing_state FROM articles WHERE id=${id}`)[0]!.processing_state, "analyzed");
   assert.equal((await sql`SELECT selection_candidate FROM publications WHERE article_id=${id}`)[0]!.selection_candidate, true);
-  assert.equal(calls.filter((s) => s === "prefilter").length, 2, "one original and one manual prefilter; recovery buys neither again");
-  assert.equal(calls.filter((s) => s === "structure").length, 1, "the paid structure response survives the score failure");
+  const evaluationCalls = calls.slice(callsBefore);
+  assert.equal(evaluationCalls.filter((s) => s === "prefilter").length, 2, "one original and one manual prefilter; recovery buys neither again");
+  assert.equal(evaluationCalls.filter((s) => s === "structure").length, 1, "the paid structure response survives the score failure");
 });
 
 // Failure modes: an old paid call can fail after a new material revision has already finished;
