@@ -70,11 +70,14 @@ jobs:
       - name: Browser test engines
         run: npx playwright install --with-deps chromium webkit
       - name: Web tests
+        id: web_tests
         run: node --test apps/web/tests/*.test.ts
 
       # Each test file runs on its own copy of aihot_ci (tests/databases.ts), which the run migrates and
       # leaves empty; the smoke check then reads that empty database.
       - name: Backend tests
+        # Keep independent regression evidence when browser tests fail; the job still fails overall.
+        if: ${{ !cancelled() && (success() || steps.web_tests.outcome == 'failure') }}
         run: npm test
       - name: Smoke check of the built site
         # The site itself runs with collection and model calls off (the tests above use local stubs).
