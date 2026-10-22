@@ -5,6 +5,7 @@ import { composeStoryDigest } from "../events/digest.ts";
 import { groupingPriority, settleNonEditorial } from "./content.ts";
 import { enqueue, ensureQueue, QUEUES, work } from "./queue.ts";
 import { sql } from "../db.ts";
+import { config } from "../config.ts";
 import { isHistorical, newsCondition } from "../content/materials.ts";
 
 export async function registerEventJobs(boss: PgBoss) {
@@ -19,7 +20,7 @@ export async function registerEventJobs(boss: PgBoss) {
     }
     return result;
   });
-  await work(boss, QUEUES.digest, { localConcurrency: 3, pollingIntervalSeconds: 5 }, ({ storyId }) => composeStoryDigest(storyId));
+  await work(boss, QUEUES.digest, { localConcurrency: config.workerConcurrency.digest, pollingIntervalSeconds: 5 }, ({ storyId }) => composeStoryDigest(storyId));
 }
 
 /**

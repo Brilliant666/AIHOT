@@ -67,6 +67,54 @@ test("429 distinguishes documented spending refusals from request and token rate
   }
 });
 
+test("different services share the last global allowance and cached answers remain usable", async () => {
+  const original = { ...config.paidRequestLimits };
+  const [count] = await sql<{ n: number }[]>`SELECT count(*) AS n FROM receipt_attempts
+    WHERE origin = 'live' AND started_at > now() - interval '1 minute'`;
+  Object.assign(config.paidRequestLimits, { minute: Number(count!.n) + 1, hour: 100000, day: 100000 });
+  const requests = ["first", "second"].map(name => ({ service: `global-${name}-${tag()}`, purpose: "invariant_test", identity: tag() }));
+  let sent = 0;
+  const send = async () => { sent++; return { response: { ok: true } }; };
+  try {
+    const results = await Promise.allSettled(requests.map(req => paidRequest(req, send)));
+    assert.equal(sent, 1);
+    const winner = results.findIndex(r => r.status === "fulfilled");
+    assert.notEqual(winner, -1);
+    const denied = results.find(r => r.status === "rejected") as PromiseRejectedResult;
+    assert.ok(denied.reason instanceof BudgetExceededError);
+    assert.match(denied.reason.message, /global-minute/);
+    assert.equal((await paidRequest(requests[winner]!, send)).reused, true);
+    assert.equal(sent, 1, "a stored answer does not reserve or spend another attempt");
+  } finally {
+    Object.assign(config.paidRequestLimits, original);
+  }
+});
+
+for (const [window, milliseconds] of [["minute", 61_000], ["hour", 3_601_000], ["day", 86_401_000]] as const) {
+  test(`global ${window} allowance recovers when a counted request leaves its window`, async () => {
+    const original = { ...config.paidRequestLimits };
+    const [counts] = await sql<{ minute: number; hour: number; day: number }[]>`
+      SELECT count(*) FILTER (WHERE started_at > now() - interval '1 minute') AS minute,
+             count(*) FILTER (WHERE started_at > now() - interval '1 hour') AS hour, count(*) AS day
+      FROM receipt_attempts WHERE origin = 'live' AND started_at > now() - interval '1 day'`;
+    Object.assign(config.paidRequestLimits, { minute: 100000, hour: 100000, day: 100000, [window]: Number(counts![window]) + 1 });
+    const service = `global-window-${tag()}`;
+    let sent = 0;
+    const send = async () => { sent++; return { response: {} }; };
+    try {
+      const first = await paidRequest({ service, purpose: "invariant_test", identity: "first" }, send);
+      const next = { service, purpose: "invariant_test", identity: "next" };
+      await assert.rejects(paidRequest(next, send), error => error instanceof BudgetExceededError && error.message.includes(`global-${window}`));
+      assert.equal(sent, 1);
+      await sql`UPDATE receipt_attempts SET started_at = ${new Date(Date.now() - milliseconds)} WHERE receipt_id = ${first.receiptId}`;
+      await paidRequest(next, send);
+      assert.equal(sent, 2);
+    } finally {
+      Object.assign(config.paidRequestLimits, original);
+    }
+  });
+}
+
 test("the migrations seed a budget for every paid service", async () => {
   const rows = await sql<{ service: string }[]>`SELECT service FROM budgets`;
   const services = new Set(rows.map((r) => r.service));

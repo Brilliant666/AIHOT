@@ -21,11 +21,23 @@ export function proxyToApi(req: IncomingMessage, res: ServerResponse, set: Outgo
   // that way by default (not DELETE, for one) and an unframed body would corrupt the pooled connection.
   if (req.headers["transfer-encoding"] && req.headers["content-length"] === undefined) headers["transfer-encoding"] = "chunked";
   const upstream = httpRequest({ hostname: API.hostname, port: API.port, path: req.url, method: req.method, headers }, (up) => {
+    // A truncated API response cannot be completed or replaced after its headers reached the client.
+    up.on("error", () => res.destroy());
     res.writeHead(up.statusCode ?? 502, endToEnd(up.headers));
     up.pipe(res);
   });
+  // A disconnected browser must not leave an unfinished upload occupying an API admission slot.
+  // Request close also fires after a complete upload, while its response can still be pending.
+  const cancel = () => upstream.destroy();
+  req.once("aborted", cancel);
+  res.once("close", () => {
+    req.off("aborted", cancel);
+    if (!res.writableFinished) cancel();
+  });
   upstream.on("error", (error) => {
+    if (req.aborted || res.destroyed) return;
     logError(error, { msg: "api proxy request failed", method: req.method, path: req.url });
+    if (res.headersSent) return res.destroy();
     res.statusCode = 502;
     res.end("api unavailable");
   });

@@ -1,9 +1,14 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.png">
-    <img src="docs/assets/banner-light.png" alt="AIHOT：每个行业，都可以有自己的 AIHOT。很多条信源流进中间的精选，再分给法律、人力资源、金融等各个行业" width="100%">
-  </picture>
-</p>
+# DokiHot
+
+DokiHot 是由 brilliant 独立维护的行业热点站，基于 [KKKKhazix/AIHOT](https://github.com/KKKKhazix/AIHOT) 的 MIT 开源框架。本站计划使用 `rardar.dokitool.com`，与上游官方站点分别运营。
+
+本 Fork 的部署与验收以 [公开部署说明](docs/public-deployment.md) 为准：默认关闭采集和模型调用，限制资源与付费请求，只手动启动。代码检查通过不等于目标主机已经部署或验收。维护者联系邮箱：brilliant12138@proton.me。
+
+登出修复采用上游 [PR #250](https://github.com/KKKKhazix/AIHOT/pull/250)（Ye Zekai / ET-yzk）的表单解析作用域方案，并增加会话撤销回归。保留上游 LICENSE、NOTICE 与贡献归属。
+
+以下保留上游框架介绍；其中第一人称与原站链接指上游作者及项目。
+
+---
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-176b75?style=flat-square" alt="MIT License"></a>

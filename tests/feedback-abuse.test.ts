@@ -96,3 +96,42 @@ test("daily cleanup removes expired temporary state and bans, preserves manual b
   assert.ok(result.expiredFeedbackState >= 1);
   assert.equal((await sql`SELECT 1 FROM feedback_bans WHERE source_hash='manual-test'`).length, 1);
 });
+
+test("concurrent different reports cannot exceed the persistent submission allowance", async () => {
+  const { feedbackSourceHash, FeedbackRejected } = await import("@aihot/backend/operations/feedback");
+  const input = { ip: "203.0.113.185", userAgent: "Firefox" };
+  const results = await Promise.allSettled(Array.from({ length: 8 }, (_, i) => submitFeedback({ ...input, content: `并发不同反馈 ${i}` })));
+  assert.equal(results.filter(r => r.status === "fulfilled").length, 3);
+  for (const result of results) if (result.status === "rejected") {
+    assert.ok(result.reason instanceof FeedbackRejected && result.reason.status === 429);
+  }
+  const source = feedbackSourceHash(input.ip, input.userAgent);
+  const [counts] = await sql`SELECT (SELECT count(*)::int FROM feedback WHERE source_hash=${source}) AS saved,
+    (SELECT count(*)::int FROM audit_log WHERE action='feedback.ban' AND subject=${`feedback-source:${source}`}) AS bans`;
+  assert.deepEqual({ ...counts }, { saved: 3, bans: 1 });
+});
+
+test("text feedback cannot reset its shared IP allowance by rotating UA families", async t => {
+  const { feedbackSourceHash, FeedbackRejected } = await import("@aihot/backend/operations/feedback");
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const families = ["Chrome", "Safari", "Firefox", "Edg", "MicroMessenger", "Mobile", "Android", "iPhone", "iPad", "Mac OS X", "Windows"];
+  const inputs = Array.from({ length: 61 }, (_, i) => ({
+    ip: "203.0.113.186", userAgent: `${families[i % families.length]} ${families[Math.floor(i / families.length)]}`,
+    content: `轮换浏览器的不同文字报告 ${i}`,
+  }));
+  const sources = inputs.map(input => feedbackSourceHash(input.ip, input.userAgent));
+  assert.equal(new Set(sources).size, inputs.length, "each request bypasses the old per-UA counter");
+  const results = await Promise.allSettled(inputs.map(input => submitFeedback(input)));
+  assert.equal(results.filter(r => r.status === "fulfilled").length, 60);
+  const denied = results.findIndex(r => r.status === "rejected");
+  const rejection = results[denied] as PromiseRejectedResult;
+  assert.ok(rejection.reason instanceof FeedbackRejected && rejection.reason.status === 429);
+  assert.equal(rejection.reason.retryAfter, 3600);
+  assert.equal((await sql`SELECT count(*)::int AS n FROM feedback WHERE source_hash IN ${sql(sources)}`)[0]!.n, 60);
+  const accepted = results.findIndex(r => r.status === "fulfilled");
+  assert.equal((await submitFeedback(inputs[accepted]!)).id, (results[accepted] as PromiseFulfilledResult<{ id: number }>).value.id,
+    "a successful retry remains available when the network allowance is exhausted");
+  await submitFeedback({ ...inputs[denied]!, ip: "203.0.113.187" });
+  t.mock.timers.tick(3600_001);
+  assert.ok((await submitFeedback(inputs[denied]!)).id, "the rolling window expires without housekeeping or a manual release");
+});

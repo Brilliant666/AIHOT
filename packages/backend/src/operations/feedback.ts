@@ -50,7 +50,31 @@ export function feedbackEmailKey(email: string): string {
 const HOUR = 3600_000;
 const MAX_SUBMISSIONS = 3;
 const MAX_ATTEMPTS = 20;
+const MAX_IP_ATTEMPTS = 60;
+// No waiting queue of large multipart buffers: a busy reader can retry shortly. This limits this
+// process's native image work; the persistent per-source allowance below is shared across processes.
+let screenshotDecoding = false;
 type Submission = { at: number; id: number; fingerprint: string };
+
+/** IP allowances cannot be reset by spoofing UA families. Text and native decoding have separate
+ * windows; state uses the existing cleanup path and stores an HMAC, never the IP itself. */
+async function reserveIpAttempt(tx: Db, ip: string, kind: "decode" | "attempt", limit: number): Promise<number> {
+  const source = `${kind}-ip:${createHmac("sha256", identifierSecret()).update(ip).digest("base64url").slice(0, 24)}`;
+  const now = Date.now();
+  const [state] = await tx<{ attempts: number[] }[]>`
+    INSERT INTO feedback_submission_state (source_hash, expires_at) VALUES (${source}, ${new Date(now + HOUR)})
+    ON CONFLICT (source_hash) DO UPDATE SET expires_at = EXCLUDED.expires_at RETURNING attempts`;
+  const attempts = state!.attempts.filter(t => t > now - HOUR);
+  if (attempts.length >= limit) return Math.max(1, Math.ceil((attempts[0]! + HOUR - now) / 1000));
+  attempts.push(now);
+  await tx`UPDATE feedback_submission_state SET attempts = ${tx.json(attempts)} WHERE source_hash = ${source}`;
+  return 0;
+}
+
+async function reserveScreenshotAttempt(ip: string): Promise<void> {
+  const retryAfter = await sql.begin(tx => reserveIpAttempt(tx, ip, "decode", MAX_ATTEMPTS));
+  if (retryAfter) throw new FeedbackRejected(429, "rate_limited", "截图提交过于频繁，请稍后重试，或先提交文字反馈。", retryAfter);
+}
 
 /** Expiry is enforced on reads; housekeeping only removes the no-longer-effective records. */
 export async function expireFeedbackBans(db: Db = sql, now = new Date(), keys?: string[]) {
@@ -89,7 +113,7 @@ export async function submitFeedback(input: FeedbackInput): Promise<{ id: number
   const source = feedbackSourceHash(input.ip, input.userAgent);
   // A ban holds under every key the source is known by.
   const keys = [source, ...serverModules().flatMap((m) => m.feedbackKeys?.(input.ip) ?? []), ...(email ? [feedbackEmailKey(email)] : [])];
-  // Check before decoding an image, then again under the per-source row lock below.
+  // Check before any work, then again under the per-source row lock below.
   const activeBan = async (db: Db, now: Date) => {
     const [ban] = await db<{ expires_at: Date | null }[]>`SELECT expires_at FROM feedback_bans
       WHERE source_hash IN ${db(keys)} AND (expires_at IS NULL OR expires_at > ${now})
@@ -102,6 +126,49 @@ export async function submitFeedback(input: FeedbackInput): Promise<{ id: number
   const banned = await activeBan(sql, new Date());
   if (banned) throw banned;
 
+  // Preserve code and whitespace inside reports. Changed contact, page or screenshot is a new report.
+  const fingerprint = createHash("sha256").update(JSON.stringify([content, email, pageUrl,
+    input.screenshot ? createHash("sha256").update(input.screenshot.data).digest("hex") : null])).digest("hex");
+  const checkSubmission = async (tx: Db, countAttempt: boolean): Promise<FeedbackRejected | { id: number } | { now: number; submissions: Submission[] }> => {
+    // The upsert locks this source and prevents housekeeping deleting its active rate window.
+    const [state] = await tx<{ attempts: number[]; submissions: Submission[] }[]>`
+      INSERT INTO feedback_submission_state (source_hash, expires_at) VALUES (${source}, ${new Date(Date.now() + HOUR)})
+      ON CONFLICT (source_hash) DO UPDATE SET expires_at = EXCLUDED.expires_at RETURNING attempts, submissions`;
+    const now = Date.now();
+    const ban = await activeBan(tx, new Date(now));
+    if (ban) return ban;
+    await expireFeedbackBans(tx, new Date(now), keys);
+    const attempts = state!.attempts.filter(t => t > now - HOUR);
+    const submissions = state!.submissions.filter(s => s.at > now - HOUR);
+    const duplicate = submissions.find(s => s.fingerprint === fingerprint);
+    // Attempt admission commits before decoding, even if the image subsequently fails. Check the
+    // submission allowance again when saving: other requests may have completed during decoding.
+    if ((countAttempt && attempts.length >= MAX_ATTEMPTS) || (!duplicate && submissions.length >= MAX_SUBMISSIONS)) {
+      const until = new Date(now + HOUR);
+      const reason = duplicate ? "持续重复提交反馈" : "一小时内持续提交反馈";
+      await tx`INSERT INTO feedback_bans (source_hash, reason, created_by, expires_at)
+        VALUES (${source}, ${reason}, 'feedback-auto', ${until})
+        ON CONFLICT (source_hash) DO NOTHING`;
+      await audit("feedback-auto", "feedback.ban", `feedback-source:${source}`, reason, null, { expires_at: until.toISOString() }, { db: tx });
+      return new FeedbackRejected(429, "rate_limited", "反馈提交过于频繁，已暂停 1 小时。请稍后再试，草稿会保留。", 3600);
+    }
+    if (countAttempt) {
+      // UA families are caller-controlled. A wider IP allowance bounds text floods while leaving
+      // room for shared networks; already-saved retries do not consume or depend on that allowance.
+      if (!duplicate) {
+        const retryAfter = await reserveIpAttempt(tx, input.ip, "attempt", MAX_IP_ATTEMPTS);
+        if (retryAfter) return new FeedbackRejected(429, "rate_limited", "当前网络提交反馈过于频繁，请稍后重试，草稿会保留。", retryAfter);
+      }
+      attempts.push(now);
+      await tx`UPDATE feedback_submission_state SET attempts = ${tx.json(attempts)}, submissions = ${tx.json(submissions)}, expires_at = ${new Date(now + HOUR)} WHERE source_hash = ${source}`;
+    }
+    return duplicate ? { id: duplicate.id } : { now, submissions };
+  };
+  const admitted = await sql.begin(tx => checkSubmission(tx, true));
+  // Throw only after commit so rejected attempts and temporary bans survive.
+  if (admitted instanceof FeedbackRejected) throw admitted;
+  if ("id" in admitted) return { id: admitted.id };
+
   let mime: ReturnType<typeof sniffImageType> = null;
   if (input.screenshot) {
     // Some phones send JPEGs as image/jpg or with no type at all: the bytes decide.
@@ -110,40 +177,24 @@ export async function submitFeedback(input: FeedbackInput): Promise<{ id: number
     if (input.screenshot.data.length > 8 * 1024 * 1024) throw new FeedbackRejected(400, "invalid_request", "截图最大 8MB。");
     // The first bytes are not enough: a PNG signature followed by noise would be kept and offered to
     // Feishu again and again. Decoding the whole picture settles it (a long phone capture fits the cap).
-    const decodes = await sharp(input.screenshot.data, { limitInputPixels: 60_000_000, failOn: "error" }).stats().then(() => true, () => false);
+    await reserveScreenshotAttempt(input.ip);
+    if (screenshotDecoding) throw new FeedbackRejected(429, "rate_limited", "截图处理繁忙，请稍后重试，草稿会保留。", 1);
+    let decodes: boolean;
+    screenshotDecoding = true;
+    try {
+      decodes = await sharp(input.screenshot.data, { limitInputPixels: 60_000_000, failOn: "error" }).stats().then(() => true, () => false);
+    } finally {
+      screenshotDecoding = false;
+    }
     if (!decodes) throw new FeedbackRejected(400, "invalid_request", "截图无法识别，请换一张图片。");
   }
-  // Preserve code and whitespace inside reports. Changed contact, page or screenshot is a new report.
-  const fingerprint = createHash("sha256").update(JSON.stringify([content, email, pageUrl,
-    input.screenshot ? createHash("sha256").update(input.screenshot.data).digest("hex") : null])).digest("hex");
   let file: string | null = null;
   try {
     const result = await sql.begin(async (tx): Promise<{ id: number; fresh: boolean } | FeedbackRejected> => {
-      // Concurrent retries and blue/green API processes must share the same decision and saved ID.
-      // The upsert also prevents housekeeping from deleting an expired row before it is locked.
-      const [state] = await tx<{ attempts: number[]; submissions: Submission[] }[]>`
-        INSERT INTO feedback_submission_state (source_hash, expires_at) VALUES (${source}, ${new Date(Date.now() + HOUR)})
-        ON CONFLICT (source_hash) DO UPDATE SET expires_at = EXCLUDED.expires_at RETURNING attempts, submissions`;
-      const now = Date.now();
-      const ban = await activeBan(tx, new Date(now));
-      if (ban) return ban;
-      await expireFeedbackBans(tx, new Date(now), keys);
-      const attempts = state!.attempts.filter(t => t > now - HOUR);
-      const submissions = state!.submissions.filter(s => s.at > now - HOUR);
-      const duplicate = submissions.find(s => s.fingerprint === fingerprint);
-      // A lost response or a few repeated clicks are safe retries. A continuing replay is still abuse.
-      if (attempts.length >= MAX_ATTEMPTS || (!duplicate && submissions.length >= MAX_SUBMISSIONS)) {
-        const until = new Date(now + HOUR);
-        const reason = duplicate ? "持续重复提交反馈" : "一小时内持续提交反馈";
-        await tx`INSERT INTO feedback_bans (source_hash, reason, created_by, expires_at)
-          VALUES (${source}, ${reason}, 'feedback-auto', ${until})
-          ON CONFLICT (source_hash) DO NOTHING`;
-        await audit("feedback-auto", "feedback.ban", `feedback-source:${source}`, reason, null, { expires_at: until.toISOString() }, { db: tx });
-        return new FeedbackRejected(429, "rate_limited", "反馈提交过于频繁，已暂停 1 小时。请稍后再试，草稿会保留。", 3600);
-      }
-      attempts.push(now);
-      await tx`UPDATE feedback_submission_state SET attempts = ${tx.json(attempts)}, submissions = ${tx.json(submissions)}, expires_at = ${new Date(now + HOUR)} WHERE source_hash = ${source}`;
-      if (duplicate) return { id: duplicate.id, fresh: false };
+      const checked = await checkSubmission(tx, false);
+      if (checked instanceof FeedbackRejected) return checked;
+      if ("id" in checked) return { id: checked.id, fresh: false };
+      const { now, submissions } = checked;
       let screenshotKey: string | null = null;
       if (input.screenshot && mime) {
         const name = `${randomUUID()}.${mime.split("/")[1]}`;

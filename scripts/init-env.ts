@@ -19,4 +19,4 @@ const text = readFileSync(".env.example", "utf8")
 writeFileSync(".env", text, { mode: 0o600 });
 console.log("已生成 .env。");
 console.log(`管理员密码：${password}（也写在 .env 的 ADMIN_PASSWORD 里）`);
-if (!llmKey) console.log("还差一步：在 .env 里填上 LLM_API_KEY（以及 LLM_BASE_URL、LLM_MODEL，默认是 DeepSeek）。");
+if (!llmKey) console.log("采集与模型调用默认关闭。空站验收不需要模型 key；准备启用时再填写 LLM_API_KEY 并设置请求与费用上限。");

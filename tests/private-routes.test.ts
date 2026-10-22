@@ -44,8 +44,12 @@ test("an unrelated malformed cookie leaves a real admin session usable without a
   const write = await app.inject({ method: "POST", url: "/api/admin/sources", headers, payload: {} });
   assert.equal(write.statusCode, 403, "the usable session still needs CSRF for writes");
 
-  const logout = await app.inject({ method: "POST", url: "/api/auth/logout", headers });
+  // Match the browser's native sign-out form, including its empty urlencoded body.
+  const logout = await app.inject({ method: "POST", url: "/api/auth/logout", headers: { ...headers, "content-type": "application/x-www-form-urlencoded" }, payload: "" });
   assert.equal(logout.statusCode, 303);
+  assert.equal(logout.headers.location, "/");
+  assert.equal(logout.headers["cache-control"], "no-store");
+  assert.equal(logout.headers["set-cookie"], `aihot_admin=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${config.siteUrl.startsWith("https://") ? "; Secure" : ""}`);
   const ended = await app.inject({ url: "/api/auth/check", headers });
   assert.equal(ended.statusCode, 401);
 });

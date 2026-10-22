@@ -8,6 +8,7 @@
 //    costs at most one repeat; after that it waits for the admin. A primary handed to a backup stays
 //    unknown for billing and is not automatically released or sent again.
 import { sql, type Db } from "../db.ts";
+import { config } from "../config.ts";
 import { sha256, stableJson } from "../lib/ids.ts";
 import { shutdownSignal } from "../lib/shutdown.ts";
 
@@ -223,6 +224,16 @@ async function clearStop(tx: Db, key: string): Promise<void> {
 }
 
 async function checkBudget(tx: Db, service: string, model?: string | null): Promise<void> {
+  // All API/worker processes share the attempt ledger and the deployment-wide admission lock.
+  // Even a service without a budget row cannot bypass the total request-count ceiling.
+  const [total] = await tx<{ minute: number; hour: number; day: number }[]>`
+    SELECT count(*) FILTER (WHERE started_at > now() - interval '1 minute') AS minute,
+           count(*) FILTER (WHERE started_at > now() - interval '1 hour') AS hour,
+           count(*) AS day
+    FROM receipt_attempts WHERE origin = 'live' AND started_at > now() - interval '1 day'`;
+  for (const [window, retry] of [["minute", 60], ["hour", 600], ["day", 3600]] as const) {
+    if (total![window] >= config.paidRequestLimits[window]) throw new BudgetExceededError(service, `global-${window}`, retry);
+  }
   // A model that refused on access or billing is not called again until its stop runs out: one refused
   // request per cooldown, not one per article. Requests already in flight cannot be stopped.
   const stopped = await stopUntil(tx, providerStopKey(service, model));
@@ -255,6 +266,7 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
   const logicalKey = logicalKeyFor(req);
 
   const claimed = await sql.begin(async (tx) => {
+    await tx`SELECT pg_advisory_xact_lock(hashtext('budget:deployment-total'))`;
     // Serialise budget checks per service so concurrent workers cannot overshoot.
     await tx`SELECT pg_advisory_xact_lock(hashtext(${"budget:" + req.service}))`;
     const [existing] = await tx<ReceiptRow[]>`
