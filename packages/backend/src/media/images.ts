@@ -106,11 +106,16 @@ async function fetchOriginal(url: string): Promise<GuardedResponse> {
   if (downloads >= MAX_CONCURRENCY) throw new ImageBudgetExceeded("Image downloading is busy");
   downloads++;
   try {
-    const reservation = await reserveUpstream(15 * 1024 * 1024);
+    const responseLimit = 15 * 1024 * 1024;
+    const reservation = await reserveUpstream(responseLimit);
     if (!reservation.ok) throw new ImageBudgetExceeded(reservation.reason);
     const res = await guardedFetch(url, {
-      timeoutMs: 20_000, maxBytes: reservation.maxBytes, headers: { accept: "image/avif,image/webp,image/*,*/*;q=0.8" },
+      timeoutMs: 20_000, maxBytes: reservation.maxBytes, truncate: reservation.maxBytes < responseLimit,
+      headers: { accept: "image/avif,image/webp,image/*,*/*;q=0.8" },
     });
+    // A smaller budget can interrupt an otherwise valid image. Recheck capacity on its next
+    // request instead of caching a source failure; the partial download keeps its reservation.
+    if (res.truncated) throw new ImageBudgetExceeded("Image response exceeds remaining upstream budget");
     // Failed/partial requests retain the reservation; only a completed body has a known byte count.
     await reservation.complete(res.body.length);
     if (res.status !== 200) throw new Error(`upstream ${res.status}`);

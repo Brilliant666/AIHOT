@@ -20,6 +20,7 @@ const { xView } = await import("@aihot/backend/publication/items");
 
 let imageHits = 0;
 let failureHits = 0;
+let oversizedHits = 0;
 let animationHits = 0;
 let slowActive = 0;
 let slowPeak = 0;
@@ -39,6 +40,11 @@ for (let at = overBudgetGif.indexOf(descriptor); at !== -1; at = overBudgetGif.i
   overBudgetGif.writeUInt16LE(11000, at + 7);
 }
 const server = createServer(async (req, res) => {
+  if (req.url === "/oversized-image") {
+    oversizedHits++;
+    res.writeHead(200, { "content-type": "image/png" });
+    return res.end(Buffer.concat([png, Buffer.alloc(15 * 1024 * 1024)]));
+  }
   if (req.url?.startsWith("/bounded-download/")) {
     slowActive++;
     slowPeak = Math.max(slowPeak, slowActive);
@@ -192,6 +198,83 @@ test("late image settlements cannot refund a newer window and day alerts expire 
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
     await sql`DELETE FROM settings WHERE key IN ('egress.imgproxy.usage', 'egress.imgproxy')`;
+  }
+});
+
+test("budget-truncated images return uncached 503 and retry after rollover or a concurrent refund", async (t) => {
+  const { sql } = await import("@aihot/backend/db");
+  const { reserveUpstream } = await import("@aihot/backend/media/upstream");
+  const { default: Fastify } = await import("fastify");
+  const { registerMedia } = await import("../apps/api/src/routes/media.ts");
+  const { signature } = await import("@aihot/backend/media/imgproxy");
+  const app = Fastify();
+  registerMedia(app);
+  const before = { minute: process.env.IMGPROXY_UPSTREAM_MB_PER_MINUTE, day: process.env.IMGPROXY_UPSTREAM_GB_PER_DAY };
+  process.env.IMGPROXY_UPSTREAM_MB_PER_MINUTE = "1";
+  process.env.IMGPROXY_UPSTREAM_GB_PER_DAY = "1";
+  const now = Date.parse("2026-10-22T05:00:59.900Z");
+  t.mock.timers.enable({ apis: ["Date"], now });
+  try {
+    for (const recovery of ["rollover", "refund"]) {
+      t.mock.timers.setTime(now);
+      await sql`DELETE FROM settings WHERE key IN ('egress.imgproxy.usage', 'egress.imgproxy')`;
+      const occupied = await reserveUpstream(999_999);
+      assert.ok(occupied.ok);
+      const url = `${base}/budget-truncated-${recovery}`;
+      const exp = String(Math.floor(now / 1000) + 3600);
+      const request = (mode: string) => `/api/img-proxy?${new URLSearchParams({ u: url, mode, exp, sig: signature(url, mode, exp) })}`;
+      const hits = imageHits;
+      const blocked = await app.inject({ url: request("thumb") });
+      assert.equal(blocked.statusCode, 503);
+      assert.equal(blocked.headers["cache-control"], "no-store");
+      assert.equal(blocked.headers["retry-after"], "60");
+      assert.equal(imageHits, hits + 1);
+      const [usage] = await sql<{ value: { minuteBytes: number; dayBytes: number } }[]>`SELECT value FROM settings WHERE key = 'egress.imgproxy.usage'`;
+      assert.equal(usage!.value.minuteBytes, 1_000_000, "the truncated response retains its reservation");
+      assert.equal(usage!.value.dayBytes, 1_000_000);
+      if (recovery === "rollover") t.mock.timers.setTime(now + 200);
+      else await occupied.complete(0);
+      const recovered = await app.inject({ url: request("full") });
+      assert.equal(recovered.statusCode, 200, "capacity recovery must not wait for a source-failure cache");
+      assert.equal(imageHits, hits + 2, "a different rendition retries the same original");
+    }
+  } finally {
+    t.mock.timers.reset();
+    for (const [key, value] of [["IMGPROXY_UPSTREAM_MB_PER_MINUTE", before.minute], ["IMGPROXY_UPSTREAM_GB_PER_DAY", before.day]] as const) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await sql`DELETE FROM settings WHERE key IN ('egress.imgproxy.usage', 'egress.imgproxy')`;
+    await app.close();
+  }
+});
+
+test("images over the full response limit still return cached 502 without refetching every mode", async () => {
+  const { sql } = await import("@aihot/backend/db");
+  const { default: Fastify } = await import("fastify");
+  const { registerMedia } = await import("../apps/api/src/routes/media.ts");
+  const { signature } = await import("@aihot/backend/media/imgproxy");
+  const app = Fastify();
+  registerMedia(app);
+  const before = { minute: process.env.IMGPROXY_UPSTREAM_MB_PER_MINUTE, day: process.env.IMGPROXY_UPSTREAM_GB_PER_DAY };
+  process.env.IMGPROXY_UPSTREAM_MB_PER_MINUTE = "32";
+  process.env.IMGPROXY_UPSTREAM_GB_PER_DAY = "1";
+  try {
+    await sql`DELETE FROM settings WHERE key IN ('egress.imgproxy.usage', 'egress.imgproxy')`;
+    const url = `${base}/oversized-image`;
+    const exp = String(Math.ceil(Date.now() / 1000) + 3600);
+    const hits = oversizedHits;
+    for (const mode of ["thumb", "full"]) {
+      const failed = await app.inject({ url: `/api/img-proxy?${new URLSearchParams({ u: url, mode, exp, sig: signature(url, mode, exp) })}` });
+      assert.equal(failed.statusCode, 502);
+      assert.equal(failed.headers["cache-control"], "public, max-age=60, s-maxage=60");
+    }
+    assert.equal(oversizedHits, hits + 1);
+  } finally {
+    for (const [key, value] of [["IMGPROXY_UPSTREAM_MB_PER_MINUTE", before.minute], ["IMGPROXY_UPSTREAM_GB_PER_DAY", before.day]] as const) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await sql`DELETE FROM settings WHERE key IN ('egress.imgproxy.usage', 'egress.imgproxy')`;
+    await app.close();
   }
 });
 
