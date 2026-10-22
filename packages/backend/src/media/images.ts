@@ -8,7 +8,7 @@ import sharp from "sharp";
 import { config } from "../config.ts";
 import { guardedFetch, type GuardedResponse } from "../lib/http-fetch.ts";
 import { IMAGE_WIDTHS } from "./renditions.ts";
-import { recordUpstream, upstreamAllowed } from "./upstream.ts";
+import { reserveUpstream } from "./upstream.ts";
 
 const CACHE_DIR = path.join(config.dataDir, "imgcache");
 const ORIGINAL_TTL_MS = 60_000;
@@ -26,6 +26,29 @@ export interface PreparedImage {
 const inflight = new Map<string, Promise<PreparedImage>>();
 const originals = new Map<string, Promise<GuardedResponse>>();
 const failures = new Map<string, { until: number; error: unknown }>();
+const MAX_CONCURRENCY = Number(process.env.IMGPROXY_MAX_CONCURRENCY ?? 2);
+if (!Number.isInteger(MAX_CONCURRENCY) || MAX_CONCURRENCY < 1 || MAX_CONCURRENCY > 8) {
+  throw new Error("IMGPROXY_MAX_CONCURRENCY must be an integer from 1 to 8");
+}
+const IMAGE_MAX_PIXELS = 40_000_000;
+let downloads = 0;
+let encoders = 0;
+const waitingEncoders: Array<() => void> = [];
+
+// Responsive modes may share an original but need separate encodes. Keep a small bounded queue;
+// a public request flood must not become an unbounded backlog holding image buffers in memory.
+async function imageWork<T>(work: () => Promise<T>): Promise<T> {
+  if (encoders >= MAX_CONCURRENCY) {
+    if (waitingEncoders.length >= MAX_CONCURRENCY * 2) throw new ImageBudgetExceeded("Image preparation is busy");
+    await new Promise<void>((resolve) => waitingEncoders.push(resolve));
+  } else encoders++;
+  try { return await work(); }
+  finally {
+    const next = waitingEncoders.shift();
+    if (next) next();
+    else encoders--;
+  }
+}
 
 // Responsive candidates and a later lightbox can request the same source in successive turns.
 // Keep at most 32 MiB / 32 originals for one minute as well as sharing in-flight downloads.
@@ -80,14 +103,19 @@ function original(url: string): Promise<GuardedResponse> {
 }
 
 async function fetchOriginal(url: string): Promise<GuardedResponse> {
-  const allowed = upstreamAllowed();
-  if (!allowed.ok) throw new ImageBudgetExceeded(allowed.reason);
-  const res = await guardedFetch(url, {
-    timeoutMs: 20_000, maxBytes: 15 * 1024 * 1024, headers: { accept: "image/avif,image/webp,image/*,*/*;q=0.8" },
-  });
-  recordUpstream(res.body.length);
-  if (res.status !== 200) throw new Error(`upstream ${res.status}`);
-  return res;
+  if (downloads >= MAX_CONCURRENCY) throw new ImageBudgetExceeded("Image downloading is busy");
+  downloads++;
+  try {
+    const reservation = await reserveUpstream(15 * 1024 * 1024);
+    if (!reservation.ok) throw new ImageBudgetExceeded(reservation.reason);
+    const res = await guardedFetch(url, {
+      timeoutMs: 20_000, maxBytes: reservation.maxBytes, headers: { accept: "image/avif,image/webp,image/*,*/*;q=0.8" },
+    });
+    // Failed/partial requests retain the reservation; only a completed body has a known byte count.
+    await reservation.complete(res.body.length);
+    if (res.status !== 200) throw new Error(`upstream ${res.status}`);
+    return res;
+  } finally { downloads--; }
 }
 
 /**
@@ -181,10 +209,12 @@ async function cachedImage(file: string, body: Buffer, type: string, mode: strin
 async function produce(url: string, mode: string): Promise<PreparedImage> {
   const file = cacheFile(url, mode);
   try {
-    const [body, meta] = await Promise.all([readFile(file), readFile(`${file}.type`, "utf8")]);
-    return cachedImage(file, body, meta, mode);
-  } catch {
-    // not cached
+    const [body, type] = await Promise.all([readFile(file), readFile(`${file}.type`, "utf8")]);
+    return await cachedImage(file, body, type, mode);
+  } catch (error) {
+    // Capacity rejection is not a cache miss. Other failures may be a missing/corrupt cache pair;
+    // keep the existing recovery through a bounded upstream fetch for those.
+    if (error instanceof ImageBudgetExceeded) throw error;
   }
   const res = await original(url);
   const image = await resizeImage(res.body, res.headers.get("content-type") ?? "", mode);
@@ -195,7 +225,7 @@ async function produce(url: string, mode: string): Promise<PreparedImage> {
 }
 
 /** Most frames × pixels an animation may have to be re-encoded (all frames are decoded at once). */
-const ANIMATION_MAX_PIXELS = 200_000_000;
+const ANIMATION_MAX_PIXELS = IMAGE_MAX_PIXELS;
 
 /**
  * Replaces a cached animated rendition (GIF passed through on the request path) with an animated
@@ -204,6 +234,10 @@ const ANIMATION_MAX_PIXELS = 200_000_000;
  * request. Returns the bytes saved (0 when nothing changed).
  */
 export async function convertAnimated(url: string, mode: string): Promise<number> {
+  return imageWork(() => convertCachedAnimation(url, mode));
+}
+
+async function convertCachedAnimation(url: string, mode: string): Promise<number> {
   const file = cacheFile(url, mode);
   const [body, type] = await Promise.all([readFile(file).catch(() => null), readFile(`${file}.type`, "utf8").catch(() => null)]);
   if (!body || type !== "image/gif") return 0;
@@ -228,12 +262,12 @@ export async function convertAnimated(url: string, mode: string): Promise<number
 
 /** Deterministic output for a signed rendition: the request's Accept header never changes the bytes. */
 export function resizeImage(body: Buffer, upstreamType: string, mode: string): Promise<{ body: Buffer; type: string }> {
-  return encodeImage(body, upstreamType, mode, true);
+  return imageWork(() => encodeImage(body, upstreamType, mode, true));
 }
 
 /** A bitmap for consumers that cannot read SVG, using the same dimensions and encoder. */
 export function rasterImage(body: Buffer, upstreamType: string, mode: string): Promise<{ body: Buffer; type: string }> {
-  return encodeImage(body, upstreamType, mode, false);
+  return imageWork(() => encodeImage(body, upstreamType, mode, false));
 }
 
 async function encodeImage(body: Buffer, upstreamType: string, mode: string, vectors: boolean): Promise<{ body: Buffer; type: string }> {
@@ -252,7 +286,9 @@ async function encodeImage(body: Buffer, upstreamType: string, mode: string, vec
   const width = IMAGE_WIDTHS[mode as keyof typeof IMAGE_WIDTHS] ?? 1600;
   const raw = ico && !Buffer.isBuffer(ico) ? { raw: { width: ico.width, height: ico.height, channels: 4 as const } } : {};
   const input = ico && !Buffer.isBuffer(ico) ? ico.raw : ico ?? body;
-  const meta = await sharp(input, { ...raw, failOn: "none" }).metadata();
+  // Metadata does not decode pixel planes. Large animations remain pass-through and must not be
+  // rejected merely because their frame descriptors exceed the background conversion limit.
+  const meta = await sharp(input, { ...raw, failOn: "none", limitInputPixels: false }).metadata();
   if (binary && !ico) {
     if (!meta.mediaType?.startsWith("image/")) throw new Error("upstream is not an image");
     type = meta.mediaType;
@@ -260,11 +296,12 @@ async function encodeImage(body: Buffer, upstreamType: string, mode: string, vec
   // A large animation can be hundreds of frames: do not silently replace it with a still or decode
   // all its frames on an HTTP request. Keep frame timing, loop count and transparency unchanged.
   if ((meta.pages ?? 1) > 1 || type === "image/gif") return { body, type };
+  if ((meta.width ?? 0) * (meta.height ?? 0) > IMAGE_MAX_PIXELS) throw new Error("Image dimensions exceed decoding limit");
   // Small vectors are already compact and remain sharp at every zoom level. Rasterize oversized
   // SVGs (often screenshots embedded as base64) and avatars at their actual display rendition.
   if (vectors && type === "image/svg+xml" && !avatar && (body.length <= SVG_PASSTHROUGH_MAX_BYTES || (meta.width !== undefined && meta.width < width))) return { body, type };
   const density = type === "image/svg+xml" && meta.width ? Math.max(72, Math.min(300, Math.ceil(width / meta.width * 72))) : 72;
-  let image = sharp(input, { ...raw, failOn: "none", density }).rotate();
+  let image = sharp(input, { ...raw, failOn: "none", density, limitInputPixels: IMAGE_MAX_PIXELS }).rotate();
   image = avatar ? image.resize(width, width, { fit: "cover" }) : image.resize({ width, withoutEnlargement: true });
   // Screenshots and transparent PNGs benefit most from modern encoding. Already lossy JPEGs
   // measured larger at WebP 88, so retain their established encoder/quality instead of growing them.

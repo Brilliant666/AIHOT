@@ -19,6 +19,10 @@ process.env.IMG_PROXY_SIGN_SECRET ??= "test-img-secret-0123456789";
 process.env.FEISHU_CONTENT_PUSH_ENABLED = "false";
 process.env.INDEXNOW_SUBMIT_ENABLED = "false";
 process.env.LOG_LEVEL ??= "error";
+// Local provider doubles exercise many calls quickly; dedicated budget tests lower these limits.
+process.env.PAID_REQUESTS_PER_MINUTE ??= "100000";
+process.env.PAID_REQUESTS_PER_HOUR ??= "100000";
+process.env.PAID_REQUESTS_PER_DAY ??= "100000";
 // Paid providers are local stubs in these tests: calls and collection may run (the valves default off).
 process.env.MODEL_CALLS_ENABLED ??= "true";
 process.env.COLLECT_ENABLED ??= "true";

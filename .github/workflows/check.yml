@@ -92,8 +92,13 @@ jobs:
         run: tail -n 60 "$RUNNER_TEMP/api.log" "$RUNNER_TEMP/web.log" 2>/dev/null || true
 
   docker:
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
+    name: Docker (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -107,12 +112,14 @@ jobs:
           sed -i 's/^COLLECT_ENABLED=.*/COLLECT_ENABLED=false/; s/^MODEL_CALLS_ENABLED=.*/MODEL_CALLS_ENABLED=false/' .env
           # The smoke check reaches the site by its compose service name.
           echo "MCP_ALLOWED_HOSTS=web" >> .env
+          echo "SITE_URL=http://127.0.0.1:3000" >> .env
       - name: Build and start with docker compose
         run: docker compose up -d --build
       - name: Smoke check
         run: |
           for i in $(seq 1 90); do curl -fsS -o /dev/null http://127.0.0.1:3000/api/health 2>/dev/null && break; sleep 2; done
           docker compose ps
+          node --env-file=.env scripts/check-admin-session.ts --base http://127.0.0.1:3000
           docker compose run --rm --no-deps --entrypoint node setup scripts/smoke.ts --base http://web:3000
           docker compose exec -T db psql -U aihot -d aihot -Atc "select count(*) from sources" | grep -qx "$(node -p "require('./industry/sources.json').sources.length")"
       - name: Logs

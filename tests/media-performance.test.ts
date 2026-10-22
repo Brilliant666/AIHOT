@@ -21,6 +21,10 @@ const { xView } = await import("@aihot/backend/publication/items");
 let imageHits = 0;
 let failureHits = 0;
 let animationHits = 0;
+let slowActive = 0;
+let slowPeak = 0;
+let releaseSlow: (() => void) | undefined;
+let holdSlow = Promise.resolve();
 const png = await sharp({ create: { width: 800, height: 400, channels: 3, background: "#176b75" } }).png().toBuffer();
 // Ten noisy 160×120 frames: a GIF that animated WebP clearly beats.
 const frames = await sharp({ create: { width: 160, height: 1200, channels: 3, background: "#808080", noise: { type: "gaussian", mean: 128, sigma: 40 } } }).raw().toBuffer();
@@ -35,6 +39,13 @@ for (let at = overBudgetGif.indexOf(descriptor); at !== -1; at = overBudgetGif.i
   overBudgetGif.writeUInt16LE(11000, at + 7);
 }
 const server = createServer(async (req, res) => {
+  if (req.url?.startsWith("/bounded-download/")) {
+    slowActive++;
+    slowPeak = Math.max(slowPeak, slowActive);
+    try { await holdSlow; res.writeHead(200, { "content-type": "image/png" }); res.end(png); }
+    finally { slowActive--; }
+    return;
+  }
   if (req.url === "/anim.gif") { animationHits++; res.writeHead(200, { "content-type": "image/gif" }); return res.end(animatedGif); }
   if (req.url === "/tiny.gif") { res.writeHead(200, { "content-type": "image/gif" }); return res.end(tinyGif); }
   if (req.url === "/over-budget.gif") { res.writeHead(200, { "content-type": "image/gif" }); return res.end(overBudgetGif); }
@@ -72,6 +83,116 @@ test("failed originals are not retried for every mode", async () => {
   await assert.rejects(produceImage(`${base}/fail`, "thumb"));
   await assert.rejects(produceImage(`${base}/fail`, "full"));
   assert.equal(failureHits, 1);
+});
+
+test("uncached image downloads have a bounded admission limit while cached images remain readable", async () => {
+  const { ImageBudgetExceeded } = await import("@aihot/backend/media/images");
+  const cached = await produceImage(`${base}/warm-bounded`, "thumb");
+  const limit = Number(process.env.IMGPROXY_MAX_CONCURRENCY ?? 2);
+  holdSlow = new Promise<void>((resolve) => { releaseSlow = resolve; });
+  slowPeak = 0;
+  const busy = Array.from({ length: limit }, (_, i) => produceImage(`${base}/bounded-download/${i}`, "thumb"));
+  try {
+    const until = Date.now() + 5000;
+    while (slowActive < limit) {
+      assert.ok(Date.now() < until, "bounded downloads reached the local stub");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await assert.rejects(produceImage(`${base}/bounded-download/rejected`, "thumb"), ImageBudgetExceeded);
+    assert.deepEqual(await produceImage(`${base}/warm-bounded`, "thumb"), cached);
+    assert.equal(slowPeak, limit);
+  } finally {
+    releaseSlow?.();
+    await Promise.all(busy);
+    holdSlow = Promise.resolve();
+  }
+  // Capacity rejection is not cached as a failed upstream; it can succeed immediately after release.
+  assert.ok((await produceImage(`${base}/bounded-download/rejected`, "thumb")).body.length > 0);
+});
+
+test("image encoding bounds its waiting queue and releases admission after completion", async () => {
+  const { resizeImage, ImageBudgetExceeded } = await import("@aihot/backend/media/images");
+  const limit = Number(process.env.IMGPROXY_MAX_CONCURRENCY ?? 2);
+  // All calls enter before the first async metadata read can finish: active + two queued per slot.
+  const results = await Promise.allSettled(Array.from({ length: limit * 3 + 1 }, () => resizeImage(png, "image/png", "thumb")));
+  assert.equal(results.filter((r) => r.status === "fulfilled").length, limit * 3);
+  const rejected = results.filter((r) => r.status === "rejected");
+  assert.equal(rejected.length, 1);
+  assert.ok(rejected[0]?.reason instanceof ImageBudgetExceeded);
+  assert.ok((await resizeImage(png, "image/png", "thumb")).body.length > 0);
+});
+
+test("image response budgets reserve atomically across module instances and retain incomplete requests", async () => {
+  const { sql } = await import("@aihot/backend/db");
+  const { reserveUpstream } = await import("@aihot/backend/media/upstream");
+  const second = await import(`../packages/backend/src/media/upstream.ts?budget-test=${Date.now()}`) as typeof import("@aihot/backend/media/upstream");
+  const before = { minute: process.env.IMGPROXY_UPSTREAM_MB_PER_MINUTE, day: process.env.IMGPROXY_UPSTREAM_GB_PER_DAY };
+  process.env.IMGPROXY_UPSTREAM_MB_PER_MINUTE = "0.001"; // 1,000 bytes
+  process.env.IMGPROXY_UPSTREAM_GB_PER_DAY = "0.000002"; // 2,000 bytes
+  const now = Date.parse("2026-10-22T05:00:00Z");
+  try {
+    await sql`DELETE FROM settings WHERE key IN ('egress.imgproxy.usage', 'egress.imgproxy')`;
+    const results = await Promise.all([reserveUpstream(600, now), second.reserveUpstream(600, now), reserveUpstream(600, now), second.reserveUpstream(600, now)]);
+    const admitted = results.filter((r) => r.ok);
+    assert.equal(admitted.length, 2);
+    assert.equal(admitted.reduce((sum, r) => sum + r.maxBytes, 0), 1000);
+    assert.equal((await second.reserveUpstream(1, now)).ok, false, "a fresh module does not reset shared usage");
+    const first = admitted.find((r) => r.maxBytes === 600)!;
+    await first.complete(100);
+    await first.complete(100); // Duplicate completion must not release capacity twice.
+    const next = await second.reserveUpstream(1000, now);
+    assert.ok(next.ok);
+    assert.equal(next.maxBytes, 500);
+    // Leave other reservations incomplete: failures/terminated processes do not erase their charge.
+    const nextMinute = await reserveUpstream(1500, now + 60_000);
+    assert.ok(nextMinute.ok);
+    assert.equal(nextMinute.maxBytes, 1000);
+    assert.equal((await reserveUpstream(1, now + 120_000)).ok, false, "day usage persists beyond the minute window");
+  } finally {
+    for (const [key, value] of [["IMGPROXY_UPSTREAM_MB_PER_MINUTE", before.minute], ["IMGPROXY_UPSTREAM_GB_PER_DAY", before.day]] as const) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await sql`DELETE FROM settings WHERE key IN ('egress.imgproxy.usage', 'egress.imgproxy')`;
+  }
+});
+
+test("late image settlements cannot refund a newer window and day alerts expire at Beijing midnight", async () => {
+  const { sql } = await import("@aihot/backend/db");
+  const { reserveUpstream, upstreamFindings } = await import("@aihot/backend/media/upstream");
+  const before = { minute: process.env.IMGPROXY_UPSTREAM_MB_PER_MINUTE, day: process.env.IMGPROXY_UPSTREAM_GB_PER_DAY };
+  process.env.IMGPROXY_UPSTREAM_MB_PER_MINUTE = "0.001";
+  process.env.IMGPROXY_UPSTREAM_GB_PER_DAY = "0.000002";
+  const now = Date.parse("2026-10-22T15:58:00Z");
+  try {
+    await sql`DELETE FROM settings WHERE key IN ('egress.imgproxy.usage', 'egress.imgproxy')`;
+    const old = await reserveUpstream(1000, now);
+    const current = await reserveUpstream(1000, now + 60_000);
+    assert.ok(old.ok && current.ok);
+    assert.equal((await reserveUpstream(1, now + 60_000)).ok, false);
+    assert.equal((await upstreamFindings(now + 60_000)).length, 1);
+    await old.complete(100);
+    assert.equal((await upstreamFindings(now + 60_000)).length, 0, "completed requests can release a temporary day exhaustion");
+    assert.equal((await reserveUpstream(1, now + 60_000)).ok, false, "old minute's refund does not change the full current minute");
+    const midnight = now + 120_000;
+    const tomorrow = await reserveUpstream(1000, midnight);
+    assert.ok(tomorrow.ok);
+    await current.complete(1);
+    assert.equal((await reserveUpstream(1, midnight)).ok, false, "yesterday's refund does not change today's full minute");
+    const later = await reserveUpstream(1500, midnight + 60_000);
+    assert.ok(later.ok);
+    assert.equal(later.maxBytes, 1000, "yesterday's refund must not reduce today's daily usage");
+    assert.equal((await reserveUpstream(1, midnight + 120_000)).ok, false);
+    assert.equal((await upstreamFindings(midnight + 86400_000)).length, 0);
+    for (const invalid of ["", "NaN", "-1", "Infinity"]) {
+      process.env.IMGPROXY_UPSTREAM_MB_PER_MINUTE = invalid;
+      await assert.rejects(reserveUpstream(1, midnight), /finite non-negative/);
+    }
+  } finally {
+    for (const [key, value] of [["IMGPROXY_UPSTREAM_MB_PER_MINUTE", before.minute], ["IMGPROXY_UPSTREAM_GB_PER_DAY", before.day]] as const) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await sql`DELETE FROM settings WHERE key IN ('egress.imgproxy.usage', 'egress.imgproxy')`;
+  }
 });
 
 // A previous encoder's disk entry must not bypass today's rendition rules, refetch the source,

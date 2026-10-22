@@ -1,3 +1,11 @@
+# DokiHot
+
+Independently maintained by brilliant, based on [KKKKhazix/AIHOT](https://github.com/KKKKhazix/AIHOT). Planned site: `rardar.dokitool.com`. See the [DokiHot deployment and acceptance guide](docs/public-deployment.md) before running this fork. Contact: brilliant12138@proton.me.
+
+The framework documentation below is retained from upstream; first-person references describe the upstream author.
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.png">

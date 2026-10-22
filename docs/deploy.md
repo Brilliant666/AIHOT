@@ -1,21 +1,23 @@
 # 部署
 
+DokiHot 的公网入口、资源限制、手动试运行和恢复验收以 [公开部署说明](public-deployment.md) 为准。默认只绑定本机、关闭采集和模型调用、不自动重启；下文保留引擎通用操作与升级历史。
+
 ## 用 Docker（推荐）
 
 需要一台装了 Docker（带 Compose）的机器。云服务器建议至少 2 核、4 GB 内存，构建镜像时要用到。
 
 ```bash
-git clone https://github.com/KKKKhazix/AIHOT.git myhot
-cd myhot
+git clone https://github.com/Brilliant666/AIHOT.git dokihot
+cd dokihot
 node scripts/init-env.ts --llm-key <你的模型 API Key>
 ```
 
 `init-env.ts` 会生成 `.env`，填好随机密钥和管理员密码，并把密码打印一次。机器上没有 Node 的话，把 `.env.example` 复制成 `.env`，自己填 `ADMIN_PASSWORD`（至少 12 位）、`SESSION_SECRET`、`IMG_PROXY_SIGN_SECRET`、`POSTGRES_PASSWORD`（各用 `openssl rand -hex 32` 生成）和 `LLM_API_KEY`。
 
-启动前检查 `.env` 的 `SITE_URL`：本机试用保留 `http://localhost:3000`；部署到服务器时改成读者实际访问的地址。例如通过服务器 IP 访问时（把示例 IP 换成自己的）：
+启动前检查 `.env` 的 `SITE_URL`：本机试用设置 `http://localhost:3000`；部署到服务器时按[公开部署说明](public-deployment.md)使用域名和 HTTPS。本机试用配置示例：
 
 ```dotenv
-SITE_URL=http://192.0.2.10:3000
+SITE_URL=http://localhost:3000
 ```
 
 RSS、分享链接、站点地图和 Agent Markdown 中的绝对链接都使用这个值，不会随浏览器访问的地址自动改变。使用域名和 HTTPS 时按下方「配域名和 HTTPS」设置。
@@ -26,7 +28,7 @@ RSS、分享链接、站点地图和 Agent Markdown 中的绝对链接都使用�
 docker compose up -d --build
 ```
 
-启动后打开 `http://服务器地址:3000`，后台在 `/admin`，用管理员密码登录。第一次启动会导入示范信源，一两分钟后开始出现内容；第一次导入的一百多条资料大约半小时处理完（每条都要预筛、评分、结构化、写标题摘要，再归组）。
+启动后在本机打开 `http://localhost:3000`，后台在 `/admin`，用管理员密码登录。默认只导入示范信源，不采集、不调用模型。先完成页面与登录验收，再配置少量信源、调用预算及供应商消费限制，明确开启采集与模型开关。
 
 `docker compose` 会起五个容器：`db`（PostgreSQL 17）、`setup`（每次启动先跑数据库迁移和种子数据，然后退出）、`api`、`worker`（抓取、模型处理、定时任务）、`web`（网页）。`web` 只接收网站地址、API 地址等网页配置，通过 HTTP 读取 API；数据库、模型和管理员密钥，以及数据卷，只交给后端容器。
 
@@ -44,7 +46,7 @@ docker compose up -d --build
 ```bash
 SITE_URL=https://example.com
 SITE_DOMAIN=example.com
-PORT=127.0.0.1:3000        # 3000 端口只给本机的 Caddy 用，不直接对外
+PORT=127.0.0.1:3000        # 回环端口不直接对外；容器 Caddy 通过 web:3000 连接
 TRUST_PROXY=true           # 访客地址从 Caddy 转来的请求头里读
 ```
 
@@ -79,7 +81,7 @@ docker compose stop api worker web
 docker compose run --rm setup && docker compose up -d
 ```
 
-迁移成功后再启动服务；迁移失败时先查看错误，不要继续启动。使用 HTTPS 配置的站点继续保留 `--profile https`。旧的 API 和 worker 要在迁移前停下：迁移可能删表删列，旧代码还在跑会出错；正常关闭 worker 会等进行中的付费调用收尾（最长三分多钟）。非 Docker 部署也按“备份、构建、停止 API/worker/web、迁移（`scripts/migrate.ts`）、种子数据（`scripts/seed.ts`）、启动”的顺序更新。
+迁移成功后再启动服务；迁移失败时先查看错误，不要继续启动。使用 HTTPS 配置的站点继续保留 `--profile https`。旧的 API 和 worker 要在迁移前停下：迁移可能删表删列，旧代码还在跑会出错；Compose 给 worker 留有 515 秒关闭窗口。非 Docker 部署也按“备份、构建、停止 API/worker/web、迁移（`scripts/migrate.ts`）、种子数据（`scripts/seed.ts`）、启动”的顺序更新。
 
 新迁移遇到长期占锁会报出文件名和等待超时，先处理占锁事务，再重跑 setup，不要跳过迁移或改写迁移账本。并发索引创建中断可能留下无效索引：核实报错中的对象后，用 `DROP INDEX CONCURRENTLY <索引名>` 清理该失败索引再重跑；有效但定义不同的同名索引须先核对差异。这些保护不改变上述 Docker 更新顺序，跨旧版本升级仍可能执行历史上的破坏性迁移。
 

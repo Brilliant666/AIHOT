@@ -1,18 +1,29 @@
-# docker compose up -d --build     → http://localhost:3000   (the admin is at /admin)
+# docker compose up -d --build     → http://127.0.0.1:3000   (the admin is at /admin)
 # docker compose --profile https up -d --build   → HTTPS for SITE_DOMAIN through Caddy
+# Runtime limits do not constrain docker build. See docs/public-deployment.md before a public launch.
 name: aihot
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "${LOG_MAX_SIZE:-10m}"
+    max-file: "${LOG_MAX_FILES:-3}"
 
 x-app: &app
   build: .
-  image: aihot-app
-  restart: unless-stopped
+  image: ${APP_IMAGE:-aihot-app}
+  restart: ${RESTART_POLICY:-no}
+  logging: *logging
+  pids_limit: 128
+  security_opt:
+    - no-new-privileges:true
 
 x-backend: &backend
   <<: *app
   env_file: .env
   environment: &backend-env
     NODE_ENV: production
-    DATABASE_URL: postgres://aihot:${POSTGRES_PASSWORD:-aihot}@db:5432/aihot
+    DATABASE_URL: postgres://aihot:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/aihot
     AIHOT_DATA_DIR: /data
     API_BASE_URL: http://api:3001
     # No proxy in front limits pushes to /api/ingest/items: the api does (per client and minute; 0 turns it off).
@@ -26,10 +37,15 @@ x-backend: &backend
 services:
   db:
     image: postgres:17-alpine
-    restart: unless-stopped
+    restart: ${RESTART_POLICY:-no}
+    logging: *logging
+    cpus: ${DB_CPUS:-0.30}
+    mem_limit: ${DB_MEMORY:-768m}
+    memswap_limit: ${DB_MEMORY:-768m}
+    pids_limit: 128
     environment:
       POSTGRES_USER: aihot
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aihot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: aihot
     volumes:
       - db:/var/lib/postgresql/data
@@ -43,21 +59,36 @@ services:
   setup:
     <<: *backend
     restart: "no"
+    cpus: ${SETUP_CPUS:-0.50}
+    mem_limit: ${SETUP_MEMORY:-512m}
+    memswap_limit: ${SETUP_MEMORY:-512m}
     command: ["sh", "-c", "node scripts/migrate.ts && node scripts/seed.ts"]
 
   api:
     <<: *backend
+    cpus: ${API_CPUS:-0.30}
+    mem_limit: ${API_MEMORY:-768m}
+    memswap_limit: ${API_MEMORY:-768m}
     command: ["node", "apps/api/src/main.ts"]
     environment:
       <<: *backend-env
       API_HOST: 0.0.0.0
       API_PORT: "3001"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
     depends_on:
       setup:
         condition: service_completed_successfully
 
   worker:
     <<: *backend
+    cpus: ${WORKER_CPUS:-0.50}
+    mem_limit: ${WORKER_MEMORY:-1536m}
+    memswap_limit: ${WORKER_MEMORY:-1536m}
     command: ["node", "apps/worker/src/main.ts"]
     # Let the worker drain backups and paid calls (STOP_TIMEOUT_MS, 470 s), then close its database.
     # Docker sends SIGTERM to the worker first; after this window it kills the remaining processes.
@@ -68,6 +99,9 @@ services:
 
   web:
     <<: *app
+    cpus: ${WEB_CPUS:-0.30}
+    mem_limit: ${WEB_MEMORY:-768m}
+    memswap_limit: ${WEB_MEMORY:-768m}
     command: ["node", "apps/web/server.ts"]
     # SSR reads the API over HTTP; backend credentials and stored files stay in api/worker.
     environment:
@@ -79,25 +113,39 @@ services:
       WEB_HOST: 0.0.0.0
       WEB_PORT: "3000"
     ports:
-      - "${PORT:-3000}:3000"
+      - "${PORT:-127.0.0.1:3000}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
     depends_on:
       api:
-        condition: service_started
+        condition: service_healthy
 
   caddy:
     image: caddy:2-alpine
     profiles: ["https"]
-    restart: unless-stopped
+    restart: ${RESTART_POLICY:-no}
+    logging: *logging
+    cpus: ${CADDY_CPUS:-0.10}
+    mem_limit: ${CADDY_MEMORY:-128m}
+    memswap_limit: ${CADDY_MEMORY:-128m}
+    pids_limit: 64
     ports:
       - "80:80"
       - "443:443"
     environment:
-      SITE_DOMAIN: ${SITE_DOMAIN:-localhost}
+      SITE_DOMAIN: ${SITE_DOMAIN:-}
+    # Keep local-only Compose usable without a domain; fail before Caddy starts when https is selected.
+    entrypoint: ["/bin/sh", "-ec", "test -n \"$$SITE_DOMAIN\" || { echo 'Set SITE_DOMAIN before enabling HTTPS' >&2; exit 1; }; exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"]
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy:/data
     depends_on:
-      - web
+      web:
+        condition: service_healthy
 
 volumes:
   db: {}
