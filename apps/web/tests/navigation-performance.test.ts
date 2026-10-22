@@ -82,6 +82,10 @@ after(async()=>{
 test('SSR list and visited query variants return offline without another read',async()=>{
   const context=await safari.newContext({viewport:{width:390,height:844}});
   const page=await context.newPage();
+  const navigations:string[]=[];
+  const failedRequests:Array<{url:string;error:string|undefined}>=[];
+  page.on('framenavigated',frame=>{if(frame===page.mainFrame())navigations.push(frame.url());});
+  page.on('requestfailed',request=>failedRequests.push({url:request.url(),error:request.failure()?.errorText}));
   try{
     await visit(page,origin+'/');
     await expect(page.getByRole('link',{name:'性能检查文章',exact:true})).toBeVisible();
@@ -101,6 +105,12 @@ test('SSR list and visited query variants return offline without another read',a
     await page.goBack();
     await expect(page.getByRole('link',{name:'分类 ai-models',exact:true})).toBeVisible({timeout:1500});
     await expect(page.locator('link[rel=canonical]')).toHaveAttribute('href',origin+'/?category=ai-models');
+  }catch(error){
+    console.error('offline navigation diagnostic',JSON.stringify({navigations,failedRequests,state:await page.evaluate(()=>{
+      const router=(globalThis as typeof globalThis & {__reactRouterDataRouter?:import('react-router').DataRouter}).__reactRouterDataRouter?.state;
+      return {url:location.href,history:history.state,visibility:document.visibilityState,focused:document.hasFocus(),router:router&&{location:router.location,navigation:router.navigation,initialized:router.initialized,errors:router.errors,loadedRoutes:Object.keys(router.loaderData)}};
+    })}));
+    throw error;
   }finally{await context.close();}
 });
 
