@@ -464,15 +464,13 @@ export async function collectXShard(key: string, sourceIds: string[]): Promise<{
 /** X accounts read by shard: a plain query and a watermark (the first fetch of an account is its own). */
 const sharded = () => sql`kind = 'x_search' AND config->>'query' ~* ${SHARDABLE_SQL} AND coalesce(config->>'searchType', 'Latest') = 'Latest' AND cursor->>'lastTweetId' IS NOT NULL`;
 
-/** Every minute: a shard is read when any of its accounts is due, all of them at once. */
+/** Every minute: only due accounts share a read; a busy neighbour cannot shorten a manual interval. */
 async function scheduleXShards(): Promise<number> {
   const rows = await sql<Array<Pick<SourceRow, "id" | "kind" | "config" | "cursor" | "participation_mode"> & { due: boolean }>>`
     SELECT id, kind, config, cursor, participation_mode, (next_fetch_at IS NULL OR next_fetch_at <= now()) AS due
     FROM sources WHERE enabled AND ${sharded()}`;
-  const due = new Set(rows.filter((r) => r.due).map((r) => r.id));
   let enqueued = 0;
-  for (const shard of planXShards(rows)) {
-    if (!shard.sourceIds.some((id) => due.has(id))) continue;
+  for (const shard of planXShards(rows.filter((r) => r.due))) {
     if (await enqueue(QUEUES.fetchXShard, { key: shard.key, sourceIds: shard.sourceIds }, { singletonKey: shard.key })) enqueued += 1;
     await sql`UPDATE sources SET next_fetch_at = now() + interval '10 minutes' WHERE id IN ${sql(shard.sourceIds)}`;
   }
@@ -498,14 +496,15 @@ const X_SHARD_MINUTES: Record<string, number> = { editorial: 30, hot_signal: 60 
 const shardMinutes = (mode: string) => X_SHARD_MINUTES[mode] ?? 60;
 
 /**
- * Daily: adapt each source's interval to its recent output (active 15 min … quiet 120 min).
- * hot_signal sources are allowed to be slower.
+ * Daily: adapt explicitly opted-in sources to their recent output. All other sources keep their
+ * operator's interval, including after an upgrade. hot_signal sources are allowed to be slower.
  */
 export async function adaptIntervals(): Promise<{ updated: number }> {
   const rows = await sql<Array<Pick<SourceRow, "id" | "participation_mode" | "kind" | "config" | "cursor"> & { paid_listing: boolean; per_day: number }>>`
     SELECT s.id, s.participation_mode, s.kind, s.config, s.cursor, coalesce(s.config->>'url', '') LIKE 'https://r.jina.ai/%' AS paid_listing,
       (SELECT count(*) FROM articles a WHERE a.source_id = s.id AND a.discovered_at > now() - interval '7 days' AND NOT a.backfill) / 7.0 AS per_day
-    FROM sources s WHERE s.enabled AND s.kind IN ('rss', 'web_list', 'json_list', 'x_search')`;
+    FROM sources s WHERE s.enabled AND s.kind IN ('rss', 'web_list', 'json_list', 'x_search')
+      AND s.config->'_aihot'->'adaptiveInterval' = 'true'::jsonb`;
   let updated = 0;
   for (const r of rows) {
     const perDay = Number(r.per_day);

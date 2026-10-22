@@ -178,7 +178,7 @@ test("due accounts are scheduled by shard, not one by one", async () => {
   assert.equal(jobs.filter((j) => j.name === "sources.fetch").length, 0, "no account of a shard is fetched on its own");
   const shard = jobs.find((j) => j.name === "sources.fetch-x");
   assert.ok(shard, "the shard with the due account is enqueued");
-  assert.ok(IDS.every((id) => jobs.some((j) => j.data.sourceIds?.includes(id))), "all its accounts are read together");
+  assert.deepEqual(shard.data.sourceIds, [IDS[1]], "accounts still inside their manual interval are not read early");
 });
 
 
@@ -265,4 +265,8 @@ test("an account takes the avatar on its own latest post, whatever its name show
   await refreshSourceIcons();
   const [source] = await sql<{ icon_url: string | null }[]>`SELECT icon_url FROM sources WHERE id = ${id}`;
   assert.equal(source!.icon_url, "https://pbs.twimg.com/profile_images/1/own.jpg", "its own post's avatar, not a later post by someone else");
+  await sql`UPDATE sources SET enabled = false, icon_url = 'https://example.test/kept.png' WHERE id = ${id}`;
+  await refreshSourceIcons();
+  const [paused] = await sql<{ icon_url: string }[]>`SELECT icon_url FROM sources WHERE id = ${id}`;
+  assert.equal(paused!.icon_url, "https://example.test/kept.png", "paused accounts keep their icon unchanged");
 });

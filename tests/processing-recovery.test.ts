@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
 import { after, afterEach, before, test } from "node:test";
 import { closeDb, sql } from "@aihot/backend/db";
+import { config } from "@aihot/backend/config";
 import { groupArticle } from "@aihot/backend/events/group";
 import { upsertMaterial } from "@aihot/backend/content/materials";
 import { rerun } from "@aihot/backend/admin/content";
@@ -70,6 +71,39 @@ async function waitFor(check: () => Promise<boolean>) {
     await delay(20);
   }
 }
+
+test("collection-only material waits without retries and resumes after models are enabled", async () => {
+  const id = await article("collection-only");
+  const boss = await getBoss();
+  const jobId = await queueProcessing(id);
+  assert.ok(jobId, "fixture includes an analysis job from the previously enabled mode");
+  await sql`UPDATE articles SET created_at=now()-interval '10 minutes' WHERE id=${id}`;
+  const hits = provider.hits();
+  config.modelCallsEnabled = false;
+  try {
+    assert.deepEqual(await processArticle(id), { state: "waiting-models" });
+    assert.equal(await queueProcessing(id, { step: "analyze", attemptTag: "manual-during-hold" }), null);
+    assert.equal(await queueProcessing(id, { step: "extract" }), null);
+    assert.deepEqual(await sweepUnprocessed(), { enqueued: 0 });
+    await registerContentJobs(boss);
+    assert.equal(boss.getWipData().filter(w => w.name === QUEUES.analyze).length, 0);
+    assert.equal((await groupArticle(id)).verdict, "skipped", "old grouping work cannot publish a free shortcut");
+    const [row] = await sql`SELECT processing_state,processing_attempts,processing_error,processing_retry_at,processing_queued_at,grouping_status FROM articles WHERE id=${id}`;
+    assert.deepEqual(row, { processing_state: "new", processing_attempts: 0, processing_error: null, processing_retry_at: null, processing_queued_at: null, grouping_status: "pending" });
+    assert.equal(provider.hits(), hits);
+    assert.equal((await sql`SELECT 1 FROM publications WHERE article_id=${id}`).length, 0);
+    await queuedMinuteAgo();
+    assert.equal((await boss.fetch(QUEUES.analyze))[0]?.id, jobId);
+    await boss.complete(QUEUES.analyze, jobId!);
+  } finally {
+    config.modelCallsEnabled = true;
+  }
+  const resumed = await sweepUnprocessed();
+  assert.ok(resumed.enqueued >= 1, "the saved new material is picked up without manual retry");
+  assert.equal((await sql`SELECT 1 FROM pgboss.job WHERE name=${QUEUES.analyze} AND data->>'articleId'=${id} AND state='created'`).length, 1);
+  assert.equal((await processArticle(id)).state, "block", "the normal local model pipeline works after resuming");
+  assert.equal(provider.hits(), hits + 1);
+});
 
 test("a failed audit rolls back the receipt release and the processing job", async () => {
   const id = await article("atomic");

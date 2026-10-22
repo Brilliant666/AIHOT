@@ -96,13 +96,23 @@ Caddy 根据 SITE_DOMAIN 申请和续期证书；此命令会联系证书服务�
 - 记录运行内存、CPU、容器重启/OOM、错误率、队列积压和磁盘增长；在少量信源下观察后再增加。确认 SSH 与 24443 TCP/UDP 代理仍可实际使用，仅监听端口存在不算代理验收。
 - 完成本节之后的成对备份与隔离恢复；保存部署 SHA、镜像摘要和验收日期。没有完成的项目明确标为待验收。
 
-## 4. 启用少量信源与付费请求
+## 4. 仅采集试运行，再决定是否启用模型
 
-先在后台只启用 3–5 个需要的信源，核对全文权限、抓取周期和历史回填范围，再填模型凭证。保持不需要的付费采集、向量、飞书、IndexNow 功能关闭。
+先在后台只启用 3 个经过确认的 RSS 信源，核对全文权限、抓取周期和历史回填范围。`COLLECT_ENABLED=true`、`MODEL_CALLS_ENABLED=false` 是仅采集模式：资料进入后台，等待后续处理；不消耗分析失败次数，也不创建新的公开文章投影。中文、缺正文的文章及遗留处理任务同样受此边界约束，后台重建不能绕过。已公开内容不会因关闭模型而全部消失，既有内容的撤回和权限收紧仍正常生效。
+
+模型关闭时不注册自动报告生成任务，旧报告定时队列会清退；遗留的报告生成调用返回跳过，不把有意留在后台的资料当成上游故障反复报错。已经保存的报告仍可读取。以后明确启用模型后，待处理文章由正常扫描恢复处理，报告调度恢复；此操作不包含在初次采集验收中。
+
+首批建议每源120分钟、`_aihot.initialBackfillLimit=3`、`sortByPublishedAt=true`，`publishedAfter`设为试运行前7天的固定UTC时刻。首次最多9条不是每天或后续轮次上限；后续抓取可补齐时间窗口内的其他条目。默认尊重人工间隔，仅设置`_aihot.adaptiveInterval=true`的源参与每日自动调频。暂停源不再参与图标抓取。详细配置见[信源说明](sources.md)。
+
+实际启用前先备份并核对有效环境，只重建需要配置变更的worker，不操作共享反代、SSH、代理或systemhog。Compose `environment`会覆盖`env_file`，只改`.env`未必生效；`docker compose restart`也不会读取新环境。先做30–60分钟人工观察，再做24小时观察。核对信源/正文请求、队列、CPU/内存、数据库增长、公开详情/API/RSS无新增资料，付费回执仍为0；不要把本机RSS可读当作生产采集通过。
+
+保持模型、付费采集、向量、飞书、IndexNow关闭且不填凭据。模型开关不阻止Jina等付费采集：需要零付费保险时，在后台将对应服务预算设为0；不要给`PAID_REQUESTS_*`环境变量填0，它们只接受正整数。`site_fulltext=false`限制公开展示，不禁止内部正文提取。仅采集模式不自动生成中文精选，也不是无模型RSS发布模式。
 
 应用级 PAID_REQUESTS_PER_MINUTE/HOUR/DAY 与每服务预算都按**请求次数**限制，不等于金额或 token 上限；重试也会消耗请求次数。必须在实际模型供应商侧设定可用的消费/余额上限。数据库中的每服务预算同样需要确认，不能用删除预算行当成禁用。
 
-工作队列并发通过 WORKER_CONCURRENCY_ANALYZE/FETCH/EXTRACT/DIGEST 启动时读取，改完需要重启 worker。初始推荐 1/2/1/1。图片上游流量和并发由 IMGPROXY_UPSTREAM_MB_PER_MINUTE、IMGPROXY_UPSTREAM_GB_PER_DAY、IMGPROXY_MAX_CONCURRENCY 限制。
+工作队列并发通过 WORKER_CONCURRENCY_ANALYZE/FETCH/EXTRACT/DIGEST 启动时读取，改完需要重建 worker。仅采集试运行建议1/1/1/1。图片上游流量和并发由 IMGPROXY_UPSTREAM_MB_PER_MINUTE、IMGPROXY_UPSTREAM_GB_PER_DAY、IMGPROXY_MAX_CONCURRENCY 限制；这不是免费采集的总请求或流量上限，免费采集目前没有每日总量硬熔断。
+
+CPU和内存配额是上限，不是预占资源：实际用量随负载变化，CPU超额受限速、内存到硬上限可能OOM退出。保留现有worker 0.5核/1536MiB等配额，先观察再决定是否调整，不通过增加资源替代采集边界。停止试采只执行`docker compose stop worker`，确认退出后再以采集关闭的配置重建；普通业务队列和数据保留，下次开启前应检查遗留手动任务。部署继续手动运行、不启用开机自启。
 
 修改 `.env` 后先运行 `node scripts/check-public-deployment.ts --live`，然后通过 Compose 重建需要新环境变量的 api/worker/web 容器，验证 `/api/health` 的发布标识与后台配置。不要只运行 `docker compose restart`：它不会读取修改后的环境变量。
 

@@ -23,7 +23,7 @@ async function refreshXAvatars(): Promise<number> {
         AND ${sourceOwnsPost(sql`xs.config`, sql`a.x_post->>'handle'`)}
       ORDER BY a.source_id, a.discovered_at DESC
     ) x
-    WHERE s.id = x.source_id AND s.icon_url IS DISTINCT FROM x.avatar
+    WHERE s.id = x.source_id AND s.enabled AND s.icon_url IS DISTINCT FROM x.avatar
     RETURNING s.id`;
   return rows.length;
 }
@@ -115,17 +115,21 @@ async function findMissingIcons(): Promise<{ checked: number; found: number }> {
     SELECT s.id, s.kind, s.config, a.urls
     FROM sources s
     LEFT JOIN LATERAL (SELECT array_agg(url) AS urls FROM (SELECT url FROM articles WHERE source_id = s.id ORDER BY discovered_at DESC LIMIT 10) r) a ON true
-    WHERE s.icon_url IS NULL AND s.kind <> 'x_search'
+    WHERE s.enabled AND s.icon_url IS NULL AND s.kind <> 'x_search'
       AND (s.icon_checked_at IS NULL OR s.icon_checked_at < now() - make_interval(days => CASE WHEN s.kind = 'mp_account' THEN ${MP_RETRY_DAYS}::int ELSE ${RETRY_DAYS}::int END))
     ORDER BY s.icon_checked_at NULLS FIRST, s.id
     LIMIT ${BATCH}`;
   let found = 0;
+  let checked = 0;
   for (const s of due) {
+    // A large batch can outlive an operator pausing a source. Do not begin its network work afterwards.
+    if (!(await sql`SELECT 1 FROM sources WHERE id = ${s.id} AND enabled`).length) continue;
+    checked++;
     const icon = await findIcon(s.kind, s.urls ?? [], s.config ?? {}).catch(() => null);
     if (icon) found++;
     await sql`UPDATE sources SET icon_url = coalesce(${icon}, icon_url), icon_checked_at = now() WHERE id = ${s.id}`;
   }
-  return { checked: due.length, found };
+  return { checked, found };
 }
 
 export async function refreshSourceIcons() {

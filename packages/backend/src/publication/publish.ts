@@ -3,6 +3,7 @@
 // Rebuilding only re-reads stored results; it never calls a model.
 import { toPublicApiCategory } from "@aihot/contracts/taxonomy";
 import { SITE } from "@aihot/site";
+import { config } from "../config.ts";
 import { one, sql, type Tx } from "../db.ts";
 import { sha256, stableJson } from "../lib/ids.ts";
 import { collapseWhitespace, isChineseText } from "../lib/text.ts";
@@ -238,6 +239,11 @@ export async function publishArticleTx(tx: Tx, articleId: string, options: Publi
            body_text, x_post, x_article, grouped_at, grouping_status, selection_adds_value
     FROM articles WHERE id = ${articleId} FOR UPDATE`;
   if (!article) return null;
+  const [previous] = await tx<PublicationRow[]>`SELECT * FROM publications WHERE article_id = ${articleId}`;
+  // All exits read this projection. Direct rebuilds, manual overrides and old queued jobs must
+  // not make newly collected material public while models are off, even if it needs no model.
+  // Existing publications remain maintainable so withdrawals and licence reductions still work.
+  if (!config.modelCallsEnabled && !previous) return null;
   // Explicit imports carry an already-public editorial decision, not a new pending judgement.
   if (options.releasedAt && article.grouping_status === "pending") {
     await tx`UPDATE articles SET grouping_status = 'complete', grouped_at = coalesce(grouped_at, ${options.releasedAt}) WHERE id = ${articleId}`;
@@ -255,7 +261,6 @@ export async function publishArticleTx(tx: Tx, articleId: string, options: Publi
     LEFT JOIN stories s ON s.id = f.story_id
     WHERE fa.article_id = ${articleId} AND NOT ${latestCompositeCondition(sql`${articleId}`)} AND fa.role IN ('primary', 'report') AND (s.id IS NULL OR s.merged_into IS NULL)
     ORDER BY (fa.role = 'primary') DESC, fa.created_at LIMIT 1`;
-  const [previous] = await tx<PublicationRow[]>`SELECT * FROM publications WHERE article_id = ${articleId}`;
   // The seats of this article's facts (before and after) are settled in this transaction: take the
   // facts' locks first, in a fixed order, so two reports of one fact never settle it at once.
   const seatFacts = [...new Set([previous?.fact_id, membership?.fact_id].filter((x): x is number => typeof x === "number"))].sort((a, b) => a - b);

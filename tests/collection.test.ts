@@ -7,7 +7,8 @@ import { after, before, test } from "node:test";
 import { config } from "@aihot/backend/config";
 import { closeDb, sql } from "@aihot/backend/db";
 import { stopBoss } from "@aihot/backend/jobs/queue";
-import { collectSource } from "@aihot/backend/sources/collect";
+import { adaptIntervals, collectSource } from "@aihot/backend/sources/collect";
+import { refreshSourceIcons } from "@aihot/backend/sources/icons";
 
 const T = tag();
 const X_SOURCE = `test-x-${T}`;
@@ -65,4 +66,60 @@ test("an X search longer than one run is read to the old watermark over the next
   assert.equal(await stored(), 45, "every post between the old watermark and the newest is stored");
   assert.equal((await cursor()).xBacklog, undefined, "nothing is left to read");
   assert.equal(socialdata.hits(), 20 + 1 + 3, "no page is requested twice");
+});
+
+test("daily adaptation preserves manual intervals and changes only explicitly opted-in, enabled sources", async () => {
+  const ids: string[] = [];
+  const expected = new Map<string, number>();
+  try {
+    for (const kind of ["rss", "web_list", "json_list", "x_search"] as const) {
+      for (const mode of ["default", "false", "true", "paused", "invalid"] as const) {
+        const id = `${T}-interval-${kind}-${mode}`;
+        ids.push(id);
+        const settings = mode === "default" ? {} : { _aihot: { adaptiveInterval: mode === "false" ? false : mode === "invalid" ? "true" : true } };
+        const config = kind === "x_search" ? { ...settings, query: `from:manual${T}` } : settings;
+        await sql`INSERT INTO sources(id,name,kind,config,enabled,interval_minutes,cursor,next_fetch_at)
+          VALUES(${id},${id},${kind},${sql.json(config)},${mode !== "paused"},180,
+            ${sql.json({ initializedAt: new Date().toISOString(), lastTweetId: "100" })},'2100-01-01')`;
+        expected.set(id, mode === "true" ? kind === "x_search" ? 30 : 60 : 180);
+      }
+    }
+    await adaptIntervals();
+    const rows = await sql<{ id: string; interval_minutes: number }[]>`SELECT id,interval_minutes FROM sources WHERE id IN ${sql(ids)}`;
+    for (const row of rows) assert.equal(row.interval_minutes, expected.get(row.id), row.id);
+    assert.equal(rows.length, ids.length);
+  } finally {
+    await sql`DELETE FROM sources WHERE id IN ${sql(ids)}`;
+  }
+});
+
+test("icon refresh makes no requests for paused sources, including one paused while the batch is running", async () => {
+  const activeId = `${T}-icon-a`, pendingId = `${T}-icon-b`, pausedId = `${T}-icon-c`;
+  const active = await stub(async () => {
+    await sql`UPDATE sources SET enabled = false WHERE id = ${pendingId}`;
+    return {};
+  });
+  const pending = await stub(() => ({}));
+  const paused = await stub(() => ({}));
+  const sources = [
+    { id: activeId, server: active, enabled: true },
+    { id: pendingId, server: pending, enabled: true },
+    { id: pausedId, server: paused, enabled: false },
+  ];
+  try {
+    for (const source of sources) {
+      await sql`INSERT INTO sources(id,name,kind,config,enabled,next_fetch_at)
+        VALUES(${source.id},${source.id},'rss',${sql.json({ feedUrl: `${source.server.url}/feed.xml` })},${source.enabled},'2100-01-01')`;
+    }
+    const result = await refreshSourceIcons();
+    assert.equal(result.checked, 1);
+    assert.ok(active.hits() > 0, "an enabled source's homepage was checked");
+    assert.equal(pending.hits(), 0, "pausing after selection still prevents starting the source's requests");
+    assert.equal(paused.hits(), 0, "a paused source is not contacted");
+    const rows = await sql<{ icon_checked_at: Date | null }[]>`SELECT icon_checked_at FROM sources WHERE id IN ${sql([pendingId, pausedId])}`;
+    assert.ok(rows.every(row => row.icon_checked_at === null), "skipped sources are not falsely marked checked");
+  } finally {
+    await sql`DELETE FROM sources WHERE id IN ${sql(sources.map(s => s.id))}`;
+    await Promise.all(sources.map(source => source.server.close()));
+  }
 });
