@@ -107,6 +107,107 @@ test("models off keeps new material private across direct, manual and historical
   assert.equal((await get(`/api/site/items/${ids[0]}`)).status, 200);
 });
 
+test("models off cannot publish an isolated projection by changing its source to editorial", async () => {
+  const source = `hold-isolated-projection-${T}`;
+  await sql`INSERT INTO sources(id,name,kind,tier,participation_mode,next_fetch_at)
+    VALUES(${source},'Isolated projection','rss','T1','isolated','2100-01-01')`;
+  const { articleId } = await upsertMaterial({ sourceId: source, url: `https://example.org/hold-isolated/${T}`,
+    title: `从未公开的资料${T}`, bodyText: BODY, bodyStatus: "ok", via: "fetch", publishedAt: new Date() });
+  assert.equal((await publishArticle(articleId))?.visibility, "withdrawn");
+  config.modelCallsEnabled = false;
+  try {
+    const [before] = await sql`SELECT updated_at FROM sources WHERE id=${source}`;
+    await updateSource(source, { patch: { participation_mode: "editorial" }, version: before!.updated_at.toISOString() }, "test");
+    await republishSource(source);
+    assert.equal((await sql`SELECT visibility FROM publications WHERE article_id=${articleId}`)[0]!.visibility, "withdrawn");
+    assert.equal((await get(`/api/site/items/${articleId}`)).status, 404);
+    assert.equal((await get(`/items/${articleId}/markdown`)).status, 404);
+  } finally {
+    config.modelCallsEnabled = true;
+  }
+});
+
+test("models off permits withdrawing public material but not restoring a withdrawn projection", async () => {
+  const id = await article();
+  await publishArticle(id, released());
+  config.modelCallsEnabled = false;
+  try {
+    assert.equal((await setVisibility(id, { visibility: "withdrawn", reason: "hold", version: 0 }, "test"))?.visibility, "withdrawn");
+    assert.equal((await setVisibility(id, { visibility: "public", reason: "requested restore while held", version: 1 }, "test"))?.visibility, "withdrawn");
+    assert.equal((await get(`/api/site/items/${id}`)).status, 404);
+    assert.equal((await get(`/api/site/items/${id}/original`)).status, 404);
+    assert.equal(await loadItemShare(id), null);
+  } finally {
+    config.modelCallsEnabled = true;
+  }
+  assert.equal((await publishArticle(id))?.visibility, "public", "the explicit restore takes effect after models resume");
+});
+
+test("collection-only revisions withdraw new article bodies and X posts until processing resumes", async () => {
+  for (const post of [false, true]) {
+    const token = `PRIVATE-REVISION-${post}-${T}`;
+    const url = `https://example.org/revision/${post}/${T}`;
+    const xPost = post ? { tweetId: `hold-revision-${T}`, authorName: "Fixture", handle: "fixture", text: "Previously public post" } : undefined;
+    const { articleId } = await upsertMaterial({ sourceId: SOURCE, url, title: `旧内容${T}`, bodyText: BODY, bodyHtml: `<p>${BODY}</p>`,
+      bodyStatus: "ok", via: "fetch", publishedAt: new Date(Date.now() - 60_000), xPost });
+    await sql`INSERT INTO analyses(article_id,input_revision,origin,relevance,title_zh,summary_zh,selected)
+      VALUES(${articleId},1,'rule','pass',${`已公开${T}`},'旧摘要',true)`;
+    await publishArticle(articleId, released());
+    assert.equal((await get(`/api/site/items/${articleId}/original`)).status, 200);
+    config.modelCallsEnabled = false;
+    try {
+      const revised = await upsertMaterial({ sourceId: SOURCE, url, title: `新内容${T}`, bodyText: token, bodyHtml: `<p>${token}</p>`,
+        bodyStatus: "ok", via: "fetch", xPost: xPost && { ...xPost, text: token } });
+      assert.equal(revised.revised, true);
+      assert.equal((await sql`SELECT body_text FROM articles WHERE id=${articleId}`)[0]!.body_text, token, "new material is retained in the backend");
+      for (const exit of [`/api/site/items/${articleId}`, `/api/site/items/${articleId}/original`, `/items/${articleId}/markdown`]) {
+        assert.equal((await get(exit)).status, 404);
+      }
+      assert.equal(await loadItemShare(articleId), null);
+      for (const exit of ["/feed/full.xml", "/feed/all.xml", "/api/v1/items?mode=all&limit=100"]) {
+        const response = await get(exit);
+        assert.ok(!response.body.includes(token) && !response.body.includes(articleId), exit);
+      }
+      assert.equal((await sql`SELECT 1 FROM editorial_overrides WHERE article_id=${articleId}`).length, 0, "automatic hold is not a permanent editorial withdrawal");
+    } finally {
+      config.modelCallsEnabled = true;
+    }
+    assert.equal((await publishArticle(articleId))?.visibility, "withdrawn", "a rebuild alone cannot release an unprocessed revision");
+    await sql`UPDATE articles SET processing_state='failed',processing_error='fixture provider failure' WHERE id=${articleId}`;
+    assert.equal((await publishArticle(articleId))?.visibility, "withdrawn", "failed current revisions cannot reuse the old analysis to reopen");
+    await sql`INSERT INTO analyses(article_id,input_revision,origin,relevance,title_zh,summary_zh,selected)
+      VALUES(${articleId},2,'rule','pass',${`新内容已判定${T}`},'已判定摘要',false)`;
+    await sql`UPDATE articles SET processing_state='analyzed' WHERE id=${articleId}`;
+    assert.equal((await publishArticle(articleId))?.visibility, "public");
+    assert.equal((await get(`/api/site/items/${articleId}/original`)).status, 200);
+  }
+});
+
+test("collection-only presentation refresh preserves already public HTML and media", async () => {
+  const id = await article();
+  await publishArticle(id, released());
+  const [before] = await sql`SELECT url,title,body_text,body_html,media,revision FROM articles WHERE id=${id}`;
+  const token = `PRIVATE-PRESENTATION-${T}`;
+  const html = `<p>${before!.body_text}</p><img src="https://example.org/${token}.png">`;
+  config.modelCallsEnabled = false;
+  try {
+    const result = await upsertMaterial({ sourceId: SOURCE, url: before!.url, title: before!.title, bodyText: before!.body_text,
+      bodyHtml: html, media: [{ kind: "image", url: `https://example.org/${token}.png` }], bodyStatus: "ok", via: "fetch" });
+    assert.equal(result.revised, false);
+    const [after] = await sql`SELECT body_html,media,revision FROM articles WHERE id=${id}`;
+    assert.deepEqual(after, { body_html: before!.body_html, media: before!.media, revision: before!.revision });
+    const detail = await get(`/api/site/items/${id}/original`);
+    assert.equal(detail.status, 200, "the unchanged old publication stays available");
+    assert.ok(!detail.body.includes(token));
+    assert.ok(!(await get(`/items/${id}/markdown`)).body.includes(token));
+  } finally {
+    config.modelCallsEnabled = true;
+  }
+  await upsertMaterial({ sourceId: SOURCE, url: before!.url, title: before!.title, bodyText: before!.body_text,
+    bodyHtml: html, bodyStatus: "ok", via: "fetch" });
+  assert.equal((await sql`SELECT body_html FROM articles WHERE id=${id}`)[0]!.body_html, html);
+});
+
 // Failure modes: a revoked score falls back to the erroneous model score, zero is treated as
 // missing, republishing loses a correction, invalid scores or stale edits alter public state,
 // or removing a correction cannot restore the saved model result without paying again.
