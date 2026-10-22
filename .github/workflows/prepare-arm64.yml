@@ -56,7 +56,7 @@ jobs:
           # Generated disposable credentials stay in this runner and are never exported or logged.
           node scripts/init-env.ts > /dev/null
           sed -i 's/^COLLECT_ENABLED=.*/COLLECT_ENABLED=false/; s/^MODEL_CALLS_ENABLED=.*/MODEL_CALLS_ENABLED=false/' .env
-          printf '\nSITE_URL=http://127.0.0.1:3000\nMCP_ALLOWED_HOSTS=web\nAIHOT_RELEASE=%s\n' "$SOURCE_SHA" >> .env
+          printf '\nSITE_URL=http://127.0.0.1:3000\nMCP_ALLOWED_HOSTS=web,127.0.0.1\nAIHOT_RELEASE=%s\n' "$SOURCE_SHA" >> .env
           docker compose config --quiet
           docker compose up -d --no-build --pull never --wait --wait-timeout 240 db setup api worker web
       - name: Verify real database, login, logout, site and MCP
@@ -64,7 +64,9 @@ jobs:
           set -euo pipefail
           node --env-file=.env scripts/check-admin-session.ts --base http://127.0.0.1:3000
           docker compose run --rm --no-deps --entrypoint node setup scripts/smoke.ts --base http://web:3000
-          docker compose run --rm --no-deps --entrypoint node setup scripts/mcp-check.ts http://web:3000/api/mcp
+          # The MCP acceptance client is a development dependency, deliberately absent from the production image.
+          npm ci --no-audit --no-fund
+          node --env-file=.env scripts/mcp-check.ts http://127.0.0.1:3000/api/mcp
           docker compose exec -T db psql -U aihot -d aihot -Atc "select count(*) from sources" | grep -qx "$(node -p "require('./industry/sources.json').sources.length")"
           for service in api worker web; do
             actual=$(docker inspect "$(docker compose ps -q "$service")" --format '{{.Image}}')
