@@ -80,4 +80,18 @@ test('faces are 精选组 sources by tier (T1, T1.5, T2), at most 6; 氛围组 o
   assert.equal(external.participantCount,12);
   assert.deepEqual(external.sourceNames,entries[0]!.sourceNames,'machine clients keep every stored source name');
   assert.deepEqual(Object.keys(external).sort(),['rank','id','title','source','links','sourceCount','signalCount','participantCount','sourceNames','latestAt'].sort(),'the external hot-topic contract is unchanged');
+
+  // A story can keep a different public representative after this participant is held. Neither
+  // a withdrawn raw revision nor an unpublished row may supply the public avatar fallback.
+  for (const visibility of ['withdrawn', 'missing'] as const) {
+    await sql`UPDATE sources SET icon_url=NULL WHERE id=${sourceId(5)}`;
+    await sql`UPDATE articles SET x_post=${sql.json({ avatarUrl: `https://example.org/PRIVATE-${visibility}-${t}.png` })} WHERE id=${sourceId(5)}`;
+    if (visibility === 'withdrawn') await sql`UPDATE publications SET visibility='withdrawn' WHERE article_id=${sourceId(5)}`;
+    else await sql`DELETE FROM publications WHERE article_id=${sourceId(5)}`;
+    const updated = await rankingExtras(ranking);
+    const face = updated.participants(entries[0]!).find(p=>p.name===name(5));
+    assert.equal(face?.iconUrl, null, `${visibility} materials cannot supply hot-list images`);
+    assert.ok(!JSON.stringify((await loadHotStrip())![0]!).includes(`PRIVATE-${visibility}`));
+    assert.ok(!JSON.stringify((await loadHot()).entries[0]!).includes(`PRIVATE-${visibility}`));
+  }
 });

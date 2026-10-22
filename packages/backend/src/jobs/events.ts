@@ -9,6 +9,7 @@ import { config } from "../config.ts";
 import { isHistorical, newsCondition } from "../content/materials.ts";
 
 export async function registerEventJobs(boss: PgBoss) {
+  if (!config.modelCallsEnabled) return;
   // Serial on purpose: two reports of the same new fact must not both create it.
   await work(boss, QUEUES.group, { localConcurrency: 1, pollingIntervalSeconds: 0.5 }, async (data) => {
     const { articleId, signalOnly } = data;
@@ -30,6 +31,7 @@ export async function registerEventJobs(boss: PgBoss) {
  * explicit rerun.
  */
 export async function sweepUngrouped(): Promise<{ enqueued: number }> {
+  if (!config.modelCallsEnabled) return { enqueued: 0 };
   await ensureQueue(QUEUES.group);
   return sql.begin(async (tx) => {
     const rows = await tx<{ id: string; participation_mode: string; backfill: boolean; published_at: Date | null; discovered_at: Date }[]>`

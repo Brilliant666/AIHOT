@@ -4,6 +4,7 @@ import { editionAt, stub, tag } from "./setup.ts";
 import assert from "node:assert/strict";
 import { after, before, beforeEach, test } from "node:test";
 import { closeDb, sql } from "@aihot/backend/db";
+import { config } from "@aihot/backend/config";
 import { addDays } from "@aihot/contracts/time";
 import { stopBoss } from "@aihot/backend/jobs/queue";
 import { composeDaily, composeDueReports, composeWeekly, composeMonthly } from "@aihot/backend/reports/compose";
@@ -36,6 +37,26 @@ async function item(date: string) {
   return id;
 }
 const report = async (kind: string, key: string) => (await sql`SELECT content, revision, generated_at FROM reports WHERE kind = ${kind} AND key = ${key}`)[0];
+
+test("collection-only report invocations wait without failures, publication or provider calls", async () => {
+  const enabled = config.modelCallsEnabled;
+  const calls = provider.hits();
+  try {
+    config.modelCallsEnabled = false;
+    for (let run = 0; run < 2; run++) {
+      assert.deepEqual(await composeDueReports(editionAt("daily", "2024-02-02", 3600)),
+        { generated: [], failed: [], skipped: "model_calls_disabled" });
+    }
+    assert.equal((await sql`SELECT id FROM reports`).length, 0);
+    assert.equal(provider.hits(), calls);
+    // Re-enabling generation restores real failures: an empty window is not a
+    // silently successful edition once editorial processing is expected to run.
+    config.modelCallsEnabled = true;
+    await assert.rejects(composeDueReports(editionAt("daily", "2024-02-02", 3600)), /reports:/);
+  } finally {
+    config.modelCallsEnabled = enabled;
+  }
+});
 
 async function daily(date: string, id?: string) {
   const sections = id ? [{ label: "行业动态", items: [{ itemId: id, title: id }] }] : [];

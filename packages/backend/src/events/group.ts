@@ -16,6 +16,7 @@
 // story get another look when a report founds a fact close to them (rematchSignals); history
 // (isHistorical) founds no event. Runs serially (queue concurrency 1).
 import { modelFor, modelRoute } from "../editorial/models.ts";
+import { config } from "../config.ts";
 import { beijingDate, beijingMidnight } from "@aihot/contracts/time";
 import { sql, type Db, type Tx } from "../db.ts";
 import { newShortId, newUuid } from "../lib/ids.ts";
@@ -232,6 +233,9 @@ export interface GroupOptions {
 }
 
 export async function groupArticle(articleId: string, opts: GroupOptions = {}): Promise<GroupResult> {
+  // Same-URL, historical and signal shortcuts can group without calling a model. Keep those
+  // paths private too, including direct invocations of a job queued before models were disabled.
+  if (!config.modelCallsEnabled) return { verdict: "skipped" };
   const input = await sql.begin(async tx => {
     const [current] = await tx<{ revision: number; grouping_status: string; selection_adds_value: boolean | null }[]>`
       SELECT revision, grouping_status, selection_adds_value FROM articles WHERE id = ${articleId} FOR UPDATE`;

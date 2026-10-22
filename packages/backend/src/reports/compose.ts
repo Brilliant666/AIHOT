@@ -11,6 +11,7 @@ import { modelFor } from "../editorial/models.ts";
 import { ENTITIES, entityNames, isRelease } from "../editorial/vocabulary.ts";
 import { addDays, beijingAt, beijingDate, beijingTime, isoWeekLabel, isoWeekRange, monthRange } from "@aihot/contracts/time";
 import { sql } from "../db.ts";
+import { config } from "../config.ts";
 import { logError } from "../lib/log-error.ts";
 import { chatJson } from "../providers/llm.ts";
 import { completeReceipt } from "../providers/receipts.ts";
@@ -302,7 +303,10 @@ const nextMonth = (label: string) => {
  * filled too. A kind with no issue yet only gets its latest due one. An issue that fails does not hold
  * up the others; at most `limit` issues are written per run, the next run continues.
  */
-export async function composeDueReports(now = new Date(), limit = 8): Promise<{ generated: string[]; failed: string[] }> {
+export async function composeDueReports(now = new Date(), limit = 8): Promise<{ generated: string[]; failed: string[]; skipped?: string }> {
+  // A stale/manual invocation in collection-only mode must not turn an intentionally
+  // unjudged inbox into failed editions or publish reports from it.
+  if (!config.modelCallsEnabled) return { generated: [], failed: [], skipped: "model_calls_disabled" };
   const generated: string[] = [];
   const failed: string[] = [];
   const kinds: Array<{ kind: ReportKind; due: string; next: (k: string) => string; end: (k: string) => string; compose: (k: string) => Promise<unknown> }> = [

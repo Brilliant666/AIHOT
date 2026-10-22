@@ -282,3 +282,15 @@ test("a source's language is an Accept-Language value, refused by kinds that rea
   }
   for (const kind of ["x_search", "mp_account", "external"] as const) assert.deepEqual(unsupportedConfig(kind, { acceptLanguage: "en" }), ["acceptLanguage"], kind);
 });
+
+test("adaptive intervals require an explicit boolean opt-in on supported collectors", () => {
+  for (const kind of ["rss", "web_list", "json_list", "x_search"] as const) {
+    for (const adaptiveInterval of [true, false]) assert.deepEqual(unsupportedConfig(kind, { _aihot: { adaptiveInterval } }), []);
+    for (const adaptiveInterval of ["true", "false", 1, null, [], {}]) {
+      assert.deepEqual(unsupportedConfig(kind, { _aihot: { adaptiveInterval } }), ["_aihot.adaptiveInterval"]);
+    }
+  }
+  for (const kind of ["mp_account", "external"] as const) {
+    assert.deepEqual(unsupportedConfig(kind, { _aihot: { adaptiveInterval: true } }), ["_aihot"]);
+  }
+});

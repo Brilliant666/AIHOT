@@ -10,6 +10,7 @@ import { stopBoss } from "@aihot/backend/jobs/queue";
 import { upsertMaterial } from "@aihot/backend/content/materials";
 import { collectSource, collectXShard, scheduleDueSources } from "@aihot/backend/sources/collect";
 import { refreshSourceIcons } from "@aihot/backend/sources/icons";
+import { publishArticle } from "@aihot/backend/publication/publish";
 import { planXShards, shardQuery, selfThreadHandle, fetchXSearch } from "@aihot/backend/sources/x";
 
 const T = tag();
@@ -178,7 +179,7 @@ test("due accounts are scheduled by shard, not one by one", async () => {
   assert.equal(jobs.filter((j) => j.name === "sources.fetch").length, 0, "no account of a shard is fetched on its own");
   const shard = jobs.find((j) => j.name === "sources.fetch-x");
   assert.ok(shard, "the shard with the due account is enqueued");
-  assert.ok(IDS.every((id) => jobs.some((j) => j.data.sourceIds?.includes(id))), "all its accounts are read together");
+  assert.deepEqual(shard.data.sourceIds, [IDS[1]], "accounts still inside their manual interval are not read early");
 });
 
 
@@ -260,9 +261,22 @@ test("an account takes the avatar on its own latest post, whatever its name show
     sourceId: id, url: `https://x.com/${author}/status/${BASE + n}`, title: `Post ${n}`, via: "fetch", discoveredAt: new Date(Date.now() - minutesAgo * 60_000),
     xPost: { tweetId: String(BASE + n), authorName: author, handle: author, avatarUrl, text: `Post ${n} ${T}` },
   });
-  await post(901n, handle.toUpperCase(), "https://pbs.twimg.com/profile_images/1/own.jpg", 2);
+  const own = await post(901n, handle.toUpperCase(), "https://pbs.twimg.com/profile_images/1/own.jpg", 2);
+  await publishArticle(own.articleId);
   await post(902n, `other${T}`, "https://pbs.twimg.com/profile_images/2/someone-else.jpg", 1);
   await refreshSourceIcons();
   const [source] = await sql<{ icon_url: string | null }[]>`SELECT icon_url FROM sources WHERE id = ${id}`;
   assert.equal(source!.icon_url, "https://pbs.twimg.com/profile_images/1/own.jpg", "its own post's avatar, not a later post by someone else");
+  config.modelCallsEnabled = false;
+  try {
+    await post(903n, handle, "https://pbs.twimg.com/profile_images/3/PRIVATE-avatar.jpg", 0);
+    await refreshSourceIcons();
+    assert.equal((await sql`SELECT icon_url FROM sources WHERE id=${id}`)[0]!.icon_url, source!.icon_url, "private collection cannot update the global icon");
+  } finally { config.modelCallsEnabled = true; }
+  await refreshSourceIcons();
+  assert.equal((await sql`SELECT icon_url FROM sources WHERE id=${id}`)[0]!.icon_url, source!.icon_url, "raw material stays private after models resume until it is published");
+  await sql`UPDATE sources SET enabled = false, icon_url = 'https://example.test/kept.png' WHERE id = ${id}`;
+  await refreshSourceIcons();
+  const [paused] = await sql<{ icon_url: string }[]>`SELECT icon_url FROM sources WHERE id = ${id}`;
+  assert.equal(paused!.icon_url, "https://example.test/kept.png", "paused accounts keep their icon unchanged");
 });

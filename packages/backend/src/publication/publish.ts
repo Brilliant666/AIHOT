@@ -3,6 +3,7 @@
 // Rebuilding only re-reads stored results; it never calls a model.
 import { toPublicApiCategory } from "@aihot/contracts/taxonomy";
 import { SITE } from "@aihot/site";
+import { config } from "../config.ts";
 import { one, sql, type Tx } from "../db.ts";
 import { sha256, stableJson } from "../lib/ids.ts";
 import { collapseWhitespace, isChineseText } from "../lib/text.ts";
@@ -19,6 +20,7 @@ import { foldableSelectionCondition, latestCompositeCondition, ownFactEvidenceCo
 
 interface ArticleRow {
   id: string;
+  revision: number;
   source_id: string;
   url: string;
   title: string;
@@ -38,6 +40,7 @@ interface ArticleRow {
 
 interface AnalysisRow {
   id: number;
+  input_revision: number;
   relevance: string | null;
   category: string | null;
   tags: string[];
@@ -108,6 +111,8 @@ export interface PublishOptions {
   now?: Date;
   /** Historical import: the item was already public, so it is released at its discovery time. */
   releasedAt?: Date | null;
+  /** A collection-only revision replaces bodies read directly by public exits: withdraw atomically. */
+  holdForProcessing?: boolean;
 }
 
 export interface PublishResult {
@@ -234,10 +239,15 @@ export async function publishArticle(articleId: string, options: PublishOptions 
 
 export async function publishArticleTx(tx: Tx, articleId: string, options: PublishOptions = {}): Promise<PublishResult | null> {
   const [article] = await tx<ArticleRow[]>`
-    SELECT id, source_id, url, title, language, published_at, discovered_at, timeline_at, backfill, body_status,
+    SELECT id, revision, source_id, url, title, language, published_at, discovered_at, timeline_at, backfill, body_status,
            body_text, x_post, x_article, grouped_at, grouping_status, selection_adds_value
     FROM articles WHERE id = ${articleId} FOR UPDATE`;
   if (!article) return null;
+  const [previous] = await tx<PublicationRow[]>`SELECT * FROM publications WHERE article_id = ${articleId}`;
+  // All exits read this projection. Direct rebuilds, manual overrides and old queued jobs must
+  // not make newly collected material public while models are off, even if it needs no model.
+  // Existing publications remain maintainable so withdrawals and licence reductions still work.
+  if (!config.modelCallsEnabled && !previous) return null;
   // Explicit imports carry an already-public editorial decision, not a new pending judgement.
   if (options.releasedAt && article.grouping_status === "pending") {
     await tx`UPDATE articles SET grouping_status = 'complete', grouped_at = coalesce(grouped_at, ${options.releasedAt}) WHERE id = ${articleId}`;
@@ -247,7 +257,7 @@ export async function publishArticleTx(tx: Tx, articleId: string, options: Publi
     SELECT id, name, kind, tier, participation_mode, first_party, site_fulltext, syndicate_fulltext FROM sources WHERE id = ${article.source_id}`;
   if (!source) return null;
   const [analysis] = await tx<AnalysisRow[]>`
-    SELECT id, relevance, category, tags, subjects, title_zh, summary_zh, reason_zh, score, selected
+    SELECT id, input_revision, relevance, category, tags, subjects, title_zh, summary_zh, reason_zh, score, selected
     FROM analyses WHERE article_id = ${articleId} ORDER BY input_revision DESC, id DESC LIMIT 1`;
   const [override] = await tx<OverrideRow[]>`SELECT fields, visibility FROM editorial_overrides WHERE article_id = ${articleId}`;
   const [membership] = await tx<{ fact_id: number; story_id: number | null }[]>`
@@ -255,7 +265,6 @@ export async function publishArticleTx(tx: Tx, articleId: string, options: Publi
     LEFT JOIN stories s ON s.id = f.story_id
     WHERE fa.article_id = ${articleId} AND NOT ${latestCompositeCondition(sql`${articleId}`)} AND fa.role IN ('primary', 'report') AND (s.id IS NULL OR s.merged_into IS NULL)
     ORDER BY (fa.role = 'primary') DESC, fa.created_at LIMIT 1`;
-  const [previous] = await tx<PublicationRow[]>`SELECT * FROM publications WHERE article_id = ${articleId}`;
   // The seats of this article's facts (before and after) are settled in this transaction: take the
   // facts' locks first, in a fixed order, so two reports of one fact never settle it at once.
   const seatFacts = [...new Set([previous?.fact_id, membership?.fact_id].filter((x): x is number => typeof x === "number"))].sort((a, b) => a - b);
@@ -279,23 +288,31 @@ export async function publishArticleTx(tx: Tx, articleId: string, options: Publi
   const relevance = typeof f.relevance === "string" ? (f.relevance as string) : analysis?.relevance ?? null;
   const judgedSelected = typeof f.selected === "boolean" ? (f.selected as boolean) : analysis?.selected ?? null;
   // Material from an isolated source reaches no public surface at all: not even a detail page.
-  const visibility = source.participation_mode === "isolated" ? "withdrawn" : (override?.visibility ?? "public");
+  // A held revision must finish processing before a rebuild can expose its new body. This is
+  // projection state, not an editorial withdrawal: successful processing can release it later.
+  const pendingRevision = source.participation_mode === "editorial" && analysis?.input_revision !== article.revision;
+  const preserveScope = !config.modelCallsEnabled && !!previous;
+  const visibility = source.participation_mode === "isolated" || options.holdForProcessing
+    || (previous?.visibility === "withdrawn" && (!config.modelCallsEnabled || pendingRevision))
+    ? "withdrawn" : (preserveScope && previous.visibility === "summary-only" && override?.visibility !== "withdrawn"
+      ? "summary-only" : (override?.visibility ?? "public"));
 
   // An undated archive has a readable detail page, but its discovery is not a news timestamp.
   // Explicit imports can retain an editorial decision already published elsewhere.
   const eligible = isPoolEligible({ participationMode: source.participation_mode, relevance, title, summary, originalPost: !!original })
-    && (!article.backfill || article.published_at !== null || !!options.releasedAt);
-  const selectionCandidate = isSelectable(eligible, judgedSelected, source.tier);
+    && (!article.backfill || article.published_at !== null || !!options.releasedAt)
+    && (!preserveScope || previous.eligible);
+  const selectionCandidate = isSelectable(eligible, judgedSelected, source.tier) && (!preserveScope || previous.selection_candidate);
   // Scoring nominates a report; a completed identity/value decision admits it to selection.
   // A historical import already has its public decision. Preserve that confirmed state on rebuild.
   const selected = selectionCandidate && article.grouping_status === "complete"
-    && (f.selected === true || article.selection_adds_value !== false);
+    && (f.selected === true || article.selection_adds_value !== false) && (!preserveScope || previous.selected);
   const reason = selected ? pickString(f.reason, original ? null : analysis?.reason_zh ?? null) : null;
   const hasXPost = !!article.x_post;
   const channel = channelOf(source.kind, hasXPost);
   const hasBody = !!article.body_text || !!article.x_post?.text || !!article.x_post?.media?.length || !!article.x_post?.quoted?.text;
-  const bodyMode = bodyModeOf(source, article.body_status, hasBody);
-  const syndicate = mayRedistribute(source, bodyMode);
+  const bodyMode = preserveScope && previous.body_mode !== "full" ? "summary" : bodyModeOf(source, article.body_status, hasBody);
+  const syndicate = mayRedistribute(source, bodyMode) && (!preserveScope || previous.syndicate);
   const originalTitle = isChineseTitle && title === collapseWhitespace(article.title) ? null : collapseWhitespace(article.title);
 
   // Waiting candidates are readable in the pool, with no selected seat, sync entry or push.
@@ -305,7 +322,7 @@ export async function publishArticleTx(tx: Tx, articleId: string, options: Publi
 
   const indexable = isIndexable({
     visibility, sourceMode: source.participation_mode, hasSummary: !!summary, selected, seoIndexedAt: previous?.seo_indexed_at ?? null, seoExcludedAt: previous?.seo_excluded_at ?? null,
-  });
+  }) && (!preserveScope || previous.indexable);
   const searchText = collapseWhitespace(
     [title, originalTitle, summary, publicSourceName(source.name), ...displayTags(tags), ...(analysis?.subjects ?? [])].filter(Boolean).join(" "),
   ).toLowerCase();

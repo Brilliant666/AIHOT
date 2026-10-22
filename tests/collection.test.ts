@@ -7,7 +7,8 @@ import { after, before, test } from "node:test";
 import { config } from "@aihot/backend/config";
 import { closeDb, sql } from "@aihot/backend/db";
 import { stopBoss } from "@aihot/backend/jobs/queue";
-import { collectSource } from "@aihot/backend/sources/collect";
+import { adaptIntervals, collectSource } from "@aihot/backend/sources/collect";
+import { refreshSourceIcons } from "@aihot/backend/sources/icons";
 
 const T = tag();
 const X_SOURCE = `test-x-${T}`;
@@ -65,4 +66,95 @@ test("an X search longer than one run is read to the old watermark over the next
   assert.equal(await stored(), 45, "every post between the old watermark and the newest is stored");
   assert.equal((await cursor()).xBacklog, undefined, "nothing is left to read");
   assert.equal(socialdata.hits(), 20 + 1 + 3, "no page is requested twice");
+});
+
+test("daily adaptation preserves manual intervals and changes only explicitly opted-in, enabled sources", async () => {
+  const ids: string[] = [];
+  const expected = new Map<string, number>();
+  try {
+    for (const variant of ["rss", "web_list", "json_list", "x_search", "x_shard"] as const) {
+      const kind = variant === "x_shard" ? "x_search" : variant;
+      for (const mode of ["default", "false", "true", "paused", "invalid"] as const) {
+        const id = `${T}-interval-${variant}-${mode}`;
+        ids.push(id);
+        const settings = mode === "default" ? {} : { _aihot: { adaptiveInterval: mode === "false" ? false : mode === "invalid" ? "true" : true } };
+        // Only a plain account search excluding replies can join a shard; other quiet X searches keep the 120-minute cap.
+        const config = kind === "x_search" ? { ...settings, query: `from:manual${T.slice(-7)}${variant === "x_shard" ? " -filter:replies" : ""}` } : settings;
+        await sql`INSERT INTO sources(id,name,kind,config,enabled,participation_mode,interval_minutes,cursor,next_fetch_at)
+          VALUES(${id},${id},${kind},${sql.json(config)},${mode !== "paused"},'editorial',180,
+            ${sql.json({ initializedAt: new Date().toISOString(), lastTweetId: "100" })},'2100-01-01')`;
+        expected.set(id, mode === "true" ? variant === "x_shard" ? 30 : kind === "x_search" ? 120 : 60 : 180);
+      }
+    }
+    await adaptIntervals();
+    const rows = await sql<{ id: string; interval_minutes: number }[]>`SELECT id,interval_minutes FROM sources WHERE id IN ${sql(ids)}`;
+    for (const row of rows) assert.equal(row.interval_minutes, expected.get(row.id), row.id);
+    assert.equal(rows.length, ids.length);
+  } finally {
+    await sql`DELETE FROM sources WHERE id IN ${sql(ids)}`;
+  }
+});
+
+test("icon refresh makes no requests for paused sources, including one paused while the batch is running", async () => {
+  const activeId = `${T}-icon-a`, pendingId = `${T}-icon-b`, pausedId = `${T}-icon-c`;
+  const active = await stub(async () => {
+    await sql`UPDATE sources SET enabled = false WHERE id = ${pendingId}`;
+    return {};
+  });
+  const pending = await stub(() => ({}));
+  const paused = await stub(() => ({}));
+  const sources = [
+    { id: activeId, server: active, enabled: true },
+    { id: pendingId, server: pending, enabled: true },
+    { id: pausedId, server: paused, enabled: false },
+  ];
+  try {
+    for (const source of sources) {
+      await sql`INSERT INTO sources(id,name,kind,config,enabled,next_fetch_at)
+        VALUES(${source.id},${source.id},'rss',${sql.json({ feedUrl: `${source.server.url}/feed.xml` })},${source.enabled},'2100-01-01')`;
+    }
+    const result = await refreshSourceIcons();
+    assert.equal(result.checked, 1);
+    assert.ok(active.hits() > 0, "an enabled source's homepage was checked");
+    assert.equal(pending.hits(), 0, "pausing after selection still prevents starting the source's requests");
+    assert.equal(paused.hits(), 0, "a paused source is not contacted");
+    const rows = await sql<{ icon_checked_at: Date | null }[]>`SELECT icon_checked_at FROM sources WHERE id IN ${sql([pendingId, pausedId])}`;
+    assert.ok(rows.every(row => row.icon_checked_at === null), "skipped sources are not falsely marked checked");
+  } finally {
+    await sql`DELETE FROM sources WHERE id IN ${sql(sources.map(s => s.id))}`;
+    await Promise.all(sources.map(source => source.server.close()));
+  }
+});
+
+test("source icons never derive from unpublished or withdrawn article URLs, even after models resume", async () => {
+  const id = `${T}-private-mp-icon`;
+  const page = await stub(() => ({ round_head_img: "https://example.org/PRIVATE-account-avatar.png" }));
+  await sql`INSERT INTO sources(id,name,kind,config,next_fetch_at)
+    VALUES(${id},${id},'mp_account','{}','2100-01-01')`;
+  for (const suffix of ['unpublished', 'withdrawn']) {
+    const articleId = `${id}-${suffix}`;
+    await sql`INSERT INTO articles(id,source_id,identity_key,url,title,discovered_at,timeline_at)
+      VALUES(${articleId},${id},${articleId},${`${page.url}/${suffix}`},'Private material',now(),now())`;
+  }
+  const withdrawnId = `${id}-withdrawn`;
+  await sql`INSERT INTO publications(article_id,source_id,title,url,timeline_at,discovered_at,sort_at,body_mode,visibility,channel)
+    VALUES(${withdrawnId},${id},'Private material',${`${page.url}/withdrawn`},now(),now(),now(),'summary','withdrawn','news')`;
+  try {
+    for (const enabled of [false, true]) {
+      config.modelCallsEnabled = enabled;
+      await sql`UPDATE sources SET icon_checked_at=NULL WHERE id=${id}`;
+      await refreshSourceIcons();
+      assert.equal(page.hits(), 0, `models ${enabled}: private article pages must not be used for public source icons`);
+      assert.equal((await sql`SELECT icon_url FROM sources WHERE id=${id}`)[0]!.icon_url, null);
+    }
+    await sql`UPDATE publications SET visibility='public' WHERE article_id=${withdrawnId}`;
+    await sql`UPDATE sources SET icon_checked_at=NULL WHERE id=${id}`;
+    await refreshSourceIcons();
+    assert.equal(page.hits(), 1, "a published article remains a usable icon discovery page");
+  } finally {
+    config.modelCallsEnabled = true;
+    await sql`DELETE FROM articles WHERE source_id=${id}`;
+    await sql`DELETE FROM sources WHERE id=${id}`;
+    await page.close();
+  }
 });

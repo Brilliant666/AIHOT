@@ -5,12 +5,34 @@ import "./setup.ts";
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
 import { closeDb, sql } from "@aihot/backend/db";
+import { config } from "@aihot/backend/config";
 import { getBoss, stopBoss } from "@aihot/backend/jobs/queue";
 import { installModules } from "@aihot/backend/modules";
 import { runsOverview } from "@aihot/backend/admin/runs";
 import { registerSchedules } from "../apps/worker/src/schedules.ts";
 
 after(async () => { await stopBoss(); await closeDb(); });
+
+test("collection-only mode retires queued report work and restores its schedule when models resume", async () => {
+  const boss = await getBoss();
+  const enabled = config.modelCallsEnabled;
+  const name = "cron.reports.compose";
+  await boss.createQueue(name);
+  await boss.schedule(name, "0,30 * * * *");
+  await boss.send(name, {}, { startAfter: "2099-01-01" });
+  try {
+    config.modelCallsEnabled = false;
+    await registerSchedules(boss);
+    assert.equal(await boss.getQueue(name), null);
+    assert.ok(!(await boss.getSchedules()).some(s => s.name === name));
+    assert.equal((await sql`SELECT id FROM pgboss.job WHERE name = ${name}`).length, 0);
+    config.modelCallsEnabled = true;
+    await registerSchedules(boss);
+    assert.ok((await boss.getSchedules()).some(s => s.name === name));
+  } finally {
+    config.modelCallsEnabled = enabled;
+  }
+});
 
 test("retired schedules leave the current overview and execution queues while live jobs and history remain", async () => {
   let externalJobs = ["external.kept", "kept", "external.kept"];

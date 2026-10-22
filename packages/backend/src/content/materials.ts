@@ -1,6 +1,7 @@
 // The single entrance for new material from every channel (collectors, external reports, imports).
 // It owns identity, revisions and the timeline rule, so no entrance can bypass them.
 import { sql, type Db, type Tx } from "../db.ts";
+import { config } from "../config.ts";
 import { newArticleId, sha256, stableJson } from "../lib/ids.ts";
 import { identityKeyForUrl } from "../lib/url.ts";
 import { collapseWhitespace, decodeEntities } from "../lib/text.ts";
@@ -341,6 +342,9 @@ export async function updatePresentation(db: Db, articleId: string, next: { html
   const html = next.html ?? a.body_html;
   const media = next.media ?? a.media;
   if (html === a.body_html && stableJson(media) === stableJson(a.media)) return false;
+  // Presentation does not create a processable revision. Preserve the previously public bytes
+  // while collecting only; a later read with models enabled can apply this presentation update.
+  if (!config.modelCallsEnabled && (await db`SELECT 1 FROM publications WHERE article_id=${articleId} AND visibility <> 'withdrawn'`).length) return false;
   if (html !== a.body_html) {
     const [tr] = await db<{ body_html: string; origin: string }[]>`
       SELECT body_html,origin FROM translations WHERE article_id=${articleId} AND lang='zh' AND revision=${a.revision} FOR UPDATE`;
@@ -375,7 +379,7 @@ export async function reviseMaterial(db: Db, articleId: string, revision: { set:
            VALUES (${articleId}, ${row!.revision}, ${revision.hash}, ${revision.title}, ${revision.bodyText})`;
   // Only withdraw an existing projection; the first publication still belongs to completed analysis.
   if ((await db`SELECT 1 FROM publications WHERE article_id = ${articleId}`).length) {
-    const published = await publishArticleTx(db as Tx, articleId);
+    const published = await publishArticleTx(db as Tx, articleId, { holdForProcessing: !config.modelCallsEnabled });
     await emit("articleChanged", { id: articleId, kind: "content", reduced: published?.reduced, reason: "material revision" }, db);
   }
 }

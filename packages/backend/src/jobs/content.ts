@@ -71,6 +71,9 @@ export function groupingPriority(a: { signal: boolean; historical: boolean }): n
  * Posts of non-editorial sources skip the analysis queue: they only need recording and grouping.
  */
 export async function queueProcessing(articleId: string, opts: { step?: Step; attemptTag?: string; db?: Db } = {}): Promise<string | null> {
+  // Collection-only material stays in `new`: the sweep resumes it after models are enabled.
+  // This also prevents body extraction and non-editorial grouping from bypassing the hold.
+  if (!runtimeConfig.modelCallsEnabled) return null;
   const db = opts.db ?? sql;
   const r = await route(articleId, db);
   if (!r) return null;
@@ -104,6 +107,7 @@ export function needsGrouping(m: { participationMode: string; historical: boolea
  * never reaches public surfaces). Returns whether it is discussion evidence to group.
  */
 export async function settleNonEditorial(articleId: string): Promise<{ group: boolean }> {
+  if (!runtimeConfig.modelCallsEnabled) return { group: false };
   const [row] = await sql<{ participation_mode: string; backfill: boolean; published_at: Date | null; discovered_at: Date }[]>`
     UPDATE articles a SET processing_state = 'skipped', processing_attempts = 0, processing_retry_at = NULL, processing_queued_at = NULL
     FROM sources s WHERE s.id = a.source_id AND a.id = ${articleId} AND s.participation_mode <> 'editorial'
@@ -127,6 +131,12 @@ async function processingInput(articleId: string) {
 export async function processArticle(articleId: string, opts: { attemptTag?: string } = {}): Promise<{ state: string; retryAt?: Date }> {
   const row = await processingInput(articleId);
   if (!row) return { state: "missing" };
+  // A job queued before collection-only mode was selected is a wait, not an article failure.
+  if (!runtimeConfig.modelCallsEnabled) {
+    await sql`UPDATE articles SET processing_retry_at = NULL, processing_queued_at = NULL
+              WHERE id = ${articleId} AND revision = ${row.revision} AND processing_state = 'new'`;
+    return { state: "waiting-models" };
+  }
   try {
     return await processRevision(articleId, row, opts);
   } catch (error) {
@@ -199,6 +209,7 @@ async function afterFailure(articleId: string, revision: number, error: unknown)
 }
 
 export async function registerContentJobs(boss: PgBoss) {
+  if (!runtimeConfig.modelCallsEnabled) return;
   await work(boss, QUEUES.analyze, { localConcurrency: runtimeConfig.workerConcurrency.analyze, pollingIntervalSeconds: 2 }, ({ articleId, attemptTag }) => processArticle(articleId, { attemptTag }));
 }
 
@@ -207,6 +218,7 @@ export async function registerContentJobs(boss: PgBoss) {
  * on the excerpt it has ("unconfirmed" body, never a wrong one).
  */
 export async function registerExtractionJobs(boss: PgBoss) {
+  if (!runtimeConfig.modelCallsEnabled) return;
   await work(boss, QUEUES.extractBody, { localConcurrency: runtimeConfig.workerConcurrency.extract, pollingIntervalSeconds: 2 }, async ({ articleId }) => {
     const [input] = await sql<{ revision: number }[]>`SELECT revision FROM articles WHERE id = ${articleId}`;
     if (!input) return { state: "missing" };
@@ -244,6 +256,7 @@ export async function registerExtractionJobs(boss: PgBoss) {
  * (pg-boss refuses the duplicate while it still exists). Returns the jobs actually created.
  */
 export async function sweepUnprocessed(): Promise<{ enqueued: number }> {
+  if (!runtimeConfig.modelCallsEnabled) return { enqueued: 0 };
   const rows = await sql<{ id: string }[]>`
     SELECT id FROM articles
     WHERE processing_state = 'new' AND created_at < now() - interval '3 minutes'

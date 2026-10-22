@@ -6,6 +6,7 @@ import type { AdminSource, AdminSourceCreated, AdminSourceDetail, AdminSourcePre
 import { REPLACEABLE_SOURCE_KINDS } from "@aihot/contracts/admin";
 import { audit, auditHistory, Conflict } from "../audit.ts";
 import { groupingReset } from "../content/provenance.ts";
+import { config as runtimeConfig } from "../config.ts";
 import { sql, type Db } from "../db.ts";
 import { enqueue, QUEUES } from "../jobs/queue.ts";
 import { republishKey, requestRepublish } from "../jobs/publication.ts";
@@ -141,6 +142,14 @@ export async function updateSource(id: string, input: { patch: unknown; version:
     const [before] = await tx`SELECT * FROM sources WHERE id = ${id} FOR UPDATE`;
     if (!before) return null;
     if (new Date(before.updated_at as Date).toISOString() !== input.version) throw new Conflict("信源已被其他操作修改，请刷新后再改");
+    // Readers join the live source row, before an asynchronous republish can run. Refuse
+    // permission expansion here; collection-only mode still permits every restriction.
+    const modeRank: Record<string, number> = { isolated: 0, hot_signal: 1, editorial: 2 };
+    if (!runtimeConfig.modelCallsEnabled && (
+      (patch.participation_mode !== undefined && modeRank[patch.participation_mode]! > modeRank[String(before.participation_mode)]!)
+      || (patch.site_fulltext === true && !before.site_fulltext)
+      || (patch.syndicate_fulltext === true && !before.syndicate_fulltext)
+    )) throw new Conflict("模型调用关闭时不能扩大公开范围，请恢复模型处理后再调整信源权限");
     const kindChanged = patch.kind !== undefined && patch.kind !== before.kind;
     if (patch.kind !== undefined && !patch.config) throw new UnsupportedConfig("调整采集方式须同时提供完整采集配置");
     if (kindChanged) {
